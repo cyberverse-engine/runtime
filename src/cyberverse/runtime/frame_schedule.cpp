@@ -36,42 +36,44 @@ constexpr double kGrowFactor = 1.1;
 
 bool is_positive_finite(double value) { return std::isfinite(value) && value > 0.0; }
 
-} // namespace
+void normalize_logic_config(schedule_config& config) noexcept {
+  if (!is_positive_finite(config.target_logic_hz)) {
+    config.target_logic_hz = kDefaultLogicHz;
+  }
+  if (!is_positive_finite(config.max_frame_time)) {
+    config.max_frame_time = kDefaultMaxFrameTime;
+  }
+  if (config.max_logic_steps_per_frame <= 0) {
+    config.max_logic_steps_per_frame = kDefaultMaxLogicSteps;
+  }
+}
 
-frame_schedule::frame_schedule(const schedule_config& config) noexcept : config_(config) {
-  if (!is_positive_finite(config_.target_logic_hz)) {
-    config_.target_logic_hz = kDefaultLogicHz;
-  }
-  if (!is_positive_finite(config_.max_frame_time)) {
-    config_.max_frame_time = kDefaultMaxFrameTime;
-  }
-  if (config_.max_logic_steps_per_frame <= 0) {
-    config_.max_logic_steps_per_frame = kDefaultMaxLogicSteps;
-  }
+schedule_config normalize_config(schedule_config config) noexcept {
+  normalize_logic_config(config);
 
-  if (!std::isfinite(config_.target_render_hz) || config_.target_render_hz < 0.0) {
-    config_.target_render_hz = 0.0;
+  if (!std::isfinite(config.target_render_hz) || config.target_render_hz < 0.0) {
+    config.target_render_hz = 0.0;
   }
-  if (config_.target_render_hz > 0.0) {
-    if (!is_positive_finite(config_.min_render_hz) || config_.min_render_hz > config_.target_render_hz) {
-      config_.min_render_hz = std::min(std::max(config_.min_render_hz, 0.0), config_.target_render_hz);
-      if (!is_positive_finite(config_.min_render_hz)) {
-        config_.min_render_hz = config_.target_render_hz;
+  if (config.target_render_hz > 0.0) {
+    if (!is_positive_finite(config.min_render_hz) || config.min_render_hz > config.target_render_hz) {
+      config.min_render_hz = std::min(std::max(config.min_render_hz, 0.0), config.target_render_hz);
+      if (!is_positive_finite(config.min_render_hz)) {
+        config.min_render_hz = config.target_render_hz;
       }
     }
   } else {
-    config_.min_render_hz = 0.0;
+    config.min_render_hz = 0.0;
   }
 
-  if (config_.auto_adjust_interval <= 0) {
-    config_.auto_adjust_interval = kDefaultAdjustInterval;
+  if (config.auto_adjust_interval <= 0) {
+    config.auto_adjust_interval = kDefaultAdjustInterval;
   }
-
-  logic_step_ = 1.0 / config_.target_logic_hz;
-  desired_render_hz_ = config_.target_render_hz;
-  target_render_hz_ = desired_render_hz_;
-  frames_since_adjust_ = 0;
+  return config;
 }
+
+} // namespace
+
+frame_schedule::frame_schedule(const schedule_config& config) noexcept { set_config(config); }
 
 void frame_schedule::target_render_hz(double hz) noexcept {
   if (!std::isfinite(hz) || hz < 0.0) {
@@ -81,6 +83,30 @@ void frame_schedule::target_render_hz(double hz) noexcept {
   config_.target_render_hz = hz;
   desired_render_hz_ = hz;
   target_render_hz_ = hz;
+  frames_since_adjust_ = 0;
+}
+
+void frame_schedule::target_logic_hz(double hz) noexcept {
+  config_.target_logic_hz = hz;
+  normalize_logic_config(config_);
+  logic_step_ = 1.0 / config_.target_logic_hz;
+}
+
+void frame_schedule::max_frame_time(double seconds) noexcept {
+  config_.max_frame_time = seconds;
+  normalize_logic_config(config_);
+}
+
+void frame_schedule::max_logic_steps_per_frame(int steps) noexcept {
+  config_.max_logic_steps_per_frame = steps;
+  normalize_logic_config(config_);
+}
+
+void frame_schedule::set_config(const schedule_config& config) noexcept {
+  config_ = normalize_config(config);
+  logic_step_ = 1.0 / config_.target_logic_hz;
+  desired_render_hz_ = config_.target_render_hz;
+  target_render_hz_ = desired_render_hz_;
   frames_since_adjust_ = 0;
 }
 
@@ -131,25 +157,54 @@ frame_schedule::fixed_step_scheduler frame_schedule::new_fixed_step_scheduler() 
   return fixed_step_scheduler(this);
 }
 
+frame_schedule::fixed_step_scheduler
+frame_schedule::new_fixed_step_scheduler(const fixed_step_overrides& overrides) const noexcept {
+  return fixed_step_scheduler(this, overrides);
+}
+
 frame_schedule::fixed_step_scheduler::fixed_step_scheduler(const frame_schedule* p_owner) noexcept
-    : config_(p_owner ? p_owner->config() : schedule_config{})
-    , logic_step_(p_owner ? p_owner->logic_step() : 1.0 / kDefaultLogicHz) {}
+    : fixed_step_scheduler(p_owner, {}) {}
+
+frame_schedule::fixed_step_scheduler::fixed_step_scheduler(const frame_schedule* p_owner,
+                                                           const fixed_step_overrides& overrides) noexcept
+    : owner_(p_owner), overrides_(overrides) {}
+
+frame_schedule::fixed_step_scheduler::fixed_step_scheduler(const schedule_config& config) noexcept
+    : standalone_config_(normalize_config(config)) {}
+
+schedule_config frame_schedule::fixed_step_scheduler::resolve_config() const noexcept {
+  schedule_config config = owner_ ? owner_->config() : standalone_config_;
+  if (overrides_.target_logic_hz) {
+    config.target_logic_hz = *overrides_.target_logic_hz;
+  }
+  if (overrides_.max_frame_time) {
+    config.max_frame_time = *overrides_.max_frame_time;
+  }
+  if (overrides_.max_logic_steps_per_frame) {
+    config.max_logic_steps_per_frame = *overrides_.max_logic_steps_per_frame;
+  }
+  normalize_logic_config(config);
+  return config;
+}
+
+schedule_config frame_schedule::fixed_step_scheduler::config() const noexcept { return resolve_config(); }
 
 step_result frame_schedule::fixed_step_scheduler::step(double delta) noexcept {
   step_result result;
 
+  const schedule_config config = resolve_config();
   double sanitized = delta;
   if (!std::isfinite(sanitized) || sanitized < 0.0) {
     sanitized = 0.0;
   }
-  if (sanitized > config_.max_frame_time) {
-    sanitized = config_.max_frame_time;
+  if (sanitized > config.max_frame_time) {
+    sanitized = config.max_frame_time;
     result.dropped_backlog = true;
   }
 
   accumulator_ += sanitized;
 
-  const double step = logic_step_;
+  const double step = 1.0 / config.target_logic_hz;
   if (!is_positive_finite(step)) {
     accumulator_ = 0.0;
     return result;
@@ -165,8 +220,8 @@ step_result frame_schedule::fixed_step_scheduler::step(double delta) noexcept {
     steps = static_cast<int>(raw_steps);
   }
 
-  if (steps > config_.max_logic_steps_per_frame) {
-    steps = config_.max_logic_steps_per_frame;
+  if (steps > config.max_logic_steps_per_frame) {
+    steps = config.max_logic_steps_per_frame;
     result.dropped_backlog = true;
 
     // Discard whole steps that cannot be executed, but keep the fractional
@@ -192,7 +247,9 @@ step_result frame_schedule::fixed_step_scheduler::step(double delta) noexcept {
 
 void frame_schedule::fixed_step_scheduler::reset() noexcept { accumulator_ = 0.0; }
 
-double frame_schedule::fixed_step_scheduler::logic_step() const noexcept { return logic_step_; }
+double frame_schedule::fixed_step_scheduler::logic_step() const noexcept {
+  return 1.0 / resolve_config().target_logic_hz;
+}
 
 double frame_schedule::fixed_step_scheduler::accumulator() const noexcept { return accumulator_; }
 

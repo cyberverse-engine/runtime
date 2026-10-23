@@ -166,6 +166,23 @@ static void BM_StatsQueries(benchmark::State& state) {
 }
 BENCHMARK(BM_StatsQueries);
 
+static void BM_StatsPercentile(benchmark::State& state) {
+  frame_stats stats(0.1, 1.0 / 60.0, 120);
+  for (int i = 0; i < 120; ++i) {
+    stats.record_frame({ 0.010 + 0.0001 * static_cast<double>(i), 0.002, 0.004, 1 });
+  }
+
+  for (auto _ : state) {
+    double p95 = stats.percentile(0.95);
+    double low = stats.min_frame_time();
+    double high = stats.max_frame_time();
+    benchmark::DoNotOptimize(p95);
+    benchmark::DoNotOptimize(low);
+    benchmark::DoNotOptimize(high);
+  }
+}
+BENCHMARK(BM_StatsPercentile);
+
 static void BM_PipelineStepFixed(benchmark::State& state) {
   auto tree = std::make_shared<clock_tree>();
   null_pipeline pipeline(frame_schedule{}, tree);
@@ -241,5 +258,40 @@ static void BM_PipelineStepFiltered(benchmark::State& state) {
   }
 }
 BENCHMARK(BM_PipelineStepFiltered);
+
+static void BM_PipelineStepPerStageFrequency(benchmark::State& state) {
+  auto tree = std::make_shared<clock_tree>();
+  null_pipeline pipeline(frame_schedule{}, tree);
+
+  frame_stage_options physics_options;
+  physics_options.target_logic_hz = 120.0;
+  add_null_stage(pipeline, "game", true, *tree);
+  add_null_stage(pipeline, "physics", true, *tree, physics_options);
+
+  for (auto _ : state) {
+    bool running = pipeline.step_frame(1.0 / 60.0);
+    benchmark::DoNotOptimize(running);
+  }
+}
+BENCHMARK(BM_PipelineStepPerStageFrequency);
+
+static void BM_PipelineStageStats(benchmark::State& state) {
+  auto tree = std::make_shared<clock_tree>();
+  null_pipeline pipeline(frame_schedule{}, tree);
+  for (int i = 0; i < 8; ++i) {
+    add_null_stage(pipeline, "stage" + std::to_string(i), i % 2 == 0, *tree);
+  }
+  bool running = pipeline.step_frame(1.0 / 60.0);
+  benchmark::DoNotOptimize(running);
+
+  for (auto _ : state) {
+    const auto& stats = pipeline.stage_stats();
+    std::size_t count = stats.size();
+    uint64_t id = stats.front().stage_id;
+    benchmark::DoNotOptimize(count);
+    benchmark::DoNotOptimize(id);
+  }
+}
+BENCHMARK(BM_PipelineStageStats);
 
 BENCHMARK_MAIN();

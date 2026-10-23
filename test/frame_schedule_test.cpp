@@ -277,3 +277,84 @@ TEST_CASE("frame_schedule unlimited mode never adapts", "[runtime][schedule]") {
 
   CHECK(schedule.is_unlimited());
 }
+
+TEST_CASE("fixed_step_scheduler follows schedule logic changes", "[runtime][schedule]") {
+  frame_schedule schedule;
+  auto scheduler = schedule.new_fixed_step_scheduler();
+
+  CHECK(scheduler.logic_step() == Approx(kLogicStep));
+  CHECK(scheduler.config().target_logic_hz == Approx(60.0));
+
+  schedule.target_logic_hz(120.0);
+  CHECK(scheduler.logic_step() == Approx(1.0 / 120.0));
+  CHECK(scheduler.config().target_logic_hz == Approx(120.0));
+
+  schedule.max_frame_time(0.01);
+  CHECK(scheduler.config().max_frame_time == Approx(0.01));
+
+  schedule.max_logic_steps_per_frame(1);
+  CHECK(scheduler.config().max_logic_steps_per_frame == 1);
+
+  const step_result result = scheduler.step(1.0);
+  CHECK(result.logic_steps == 1);
+  CHECK(result.dropped_backlog);
+
+  schedule.set_config(schedule_config{});
+  CHECK(scheduler.logic_step() == Approx(kLogicStep));
+  CHECK(scheduler.config().max_frame_time == Approx(0.25));
+  CHECK(scheduler.config().max_logic_steps_per_frame == 5);
+
+  schedule.target_logic_hz(0.0);
+  CHECK(scheduler.logic_step() == Approx(kLogicStep));
+  schedule.max_frame_time(-1.0);
+  CHECK(scheduler.config().max_frame_time == Approx(0.25));
+  schedule.max_logic_steps_per_frame(0);
+  CHECK(scheduler.config().max_logic_steps_per_frame == 5);
+}
+
+TEST_CASE("fixed_step_scheduler pins only overridden logic fields", "[runtime][schedule]") {
+  frame_schedule schedule;
+
+  frame_schedule::fixed_step_overrides frequency_override;
+  frequency_override.target_logic_hz = 30.0;
+  auto scheduler = schedule.new_fixed_step_scheduler(frequency_override);
+
+  CHECK(scheduler.logic_step() == Approx(1.0 / 30.0));
+
+  schedule.target_logic_hz(240.0);
+  schedule.max_frame_time(0.05);
+  schedule.max_logic_steps_per_frame(1);
+
+  CHECK(scheduler.logic_step() == Approx(1.0 / 30.0));
+  CHECK(scheduler.config().target_logic_hz == Approx(30.0));
+  CHECK(scheduler.config().max_frame_time == Approx(0.05));
+  CHECK(scheduler.config().max_logic_steps_per_frame == 1);
+
+  frame_schedule::fixed_step_overrides frame_time_override;
+  frame_time_override.max_frame_time = 0.02;
+  auto frame_pinned = schedule.new_fixed_step_scheduler(frame_time_override);
+
+  schedule.target_logic_hz(90.0);
+  CHECK(frame_pinned.logic_step() == Approx(1.0 / 90.0));
+  CHECK(frame_pinned.config().max_frame_time == Approx(0.02));
+}
+
+TEST_CASE("fixed_step_scheduler supports standalone explicit configuration", "[runtime][schedule]") {
+  schedule_config config;
+  config.target_logic_hz = 120.0;
+  config.max_logic_steps_per_frame = 2;
+  frame_schedule::fixed_step_scheduler scheduler(config);
+
+  CHECK(scheduler.logic_step() == Approx(1.0 / 120.0));
+  CHECK(scheduler.step(1.0 / 60.0).logic_steps == 2);
+  CHECK(scheduler.step(1.0 / 60.0).logic_steps == 2);
+
+  frame_schedule schedule;
+  schedule.target_logic_hz(30.0);
+  CHECK(scheduler.logic_step() == Approx(1.0 / 120.0));
+
+  schedule_config clamped = config;
+  clamped.target_logic_hz = 0.0;
+  frame_schedule::fixed_step_scheduler fallback(clamped);
+  CHECK(fallback.logic_step() == Approx(1.0 / 60.0));
+}

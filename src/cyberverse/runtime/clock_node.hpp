@@ -63,6 +63,9 @@ public:
   /** @brief Debug name of this clock. */
   std::string_view name() const noexcept;
 
+  /** @brief Return whether this node has no live parent clock. */
+  bool is_root() const noexcept;
+
   /**
    * @brief Pause or resume this node locally.
    *
@@ -114,11 +117,11 @@ public:
   /**
    * @brief Get or create a direct child.
    *
-   * @param name Child name. Must not be empty.
+   * @param name Child name. Must be non-empty and contain no '/'.
    * @return Reference to the shared owner stored by this node. Use
    * @ref clock_tree::ensure when a value-owned `std::shared_ptr` is preferred.
    *
-   * @throws std::invalid_argument when @p name is empty.
+   * @throws std::invalid_argument when @p name is empty or contains '/'.
    *
    * The reference is invalidated by @ref erase or @ref clear (enlarging the
    * child list keeps references to existing children valid).

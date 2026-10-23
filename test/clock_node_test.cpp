@@ -130,6 +130,7 @@ TEST_CASE("clock_node ensure contains erase and clear", "[runtime][clock]") {
   CHECK(root->contains("game"));
   CHECK(root->ensure("game") == game);
   CHECK_THROWS_AS(root->ensure(""), std::invalid_argument);
+  CHECK_THROWS_AS(root->ensure("a/b"), std::invalid_argument);
 
   root->ensure("ui");
   CHECK(root->contains("ui"));

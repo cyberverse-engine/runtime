@@ -13,7 +13,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <thread>
 #include <utility>
 
 namespace cyberverse::runtime {
@@ -34,14 +33,39 @@ double fallback_budget(const frame_schedule& schedule) {
   return logic > 0.0 ? logic : 1.0 / 60.0;
 }
 
+frame_schedule::fixed_step_overrides scheduler_overrides(const frame_stage_options& options) {
+  frame_schedule::fixed_step_overrides overrides;
+  if (std::isfinite(options.target_logic_hz) && options.target_logic_hz > 0.0) {
+    overrides.target_logic_hz = options.target_logic_hz;
+  }
+  if (std::isfinite(options.max_frame_time) && options.max_frame_time > 0.0) {
+    overrides.max_frame_time = options.max_frame_time;
+  }
+  if (options.max_logic_steps_per_frame > 0) {
+    overrides.max_logic_steps_per_frame = options.max_logic_steps_per_frame;
+  }
+  return overrides;
+}
+
+frame_schedule::fixed_step_scheduler make_stage_scheduler(const frame_schedule& schedule,
+                                                          const frame_stage_options& options) {
+  return frame_schedule::fixed_step_scheduler(&schedule, scheduler_overrides(options));
+}
+
 } // namespace
 
-frame_pipeline::frame_pipeline(frame_schedule schedule, std::shared_ptr<clock_tree> p_clock_tree)
+frame_pipeline::frame_pipeline(frame_schedule schedule,
+                               std::shared_ptr<clock_tree> p_clock_tree,
+                               std::shared_ptr<frame_clock> p_pacing_clock)
     : schedule_(schedule)
     , stats_(0.1, fallback_budget(schedule))
-    , clock_tree_(p_clock_tree ? std::move(p_clock_tree) : std::make_shared<clock_tree>()) {}
+    , clock_tree_(p_clock_tree ? std::move(p_clock_tree) : std::make_shared<clock_tree>())
+    , pacing_clock_(p_pacing_clock ? std::move(p_pacing_clock) : std::make_shared<steady_frame_clock>()) {}
 
 void frame_pipeline::run() {
+  double next_deadline = 0.0;
+  bool has_deadline = false;
+
   while (!should_quit()) {
     if (should_quit_requested()) {
       request_quit();
@@ -50,10 +74,26 @@ void frame_pipeline::run() {
 
     const double frame_time = tick_clock();
 
-    if (schedule_.should_throttle(frame_time)) {
-      const double remaining = schedule_.target_frame_time() - frame_time;
-      if (remaining > 0.0) {
-        on_throttle_wait(remaining);
+    if (schedule_.is_unlimited()) {
+      has_deadline = false;
+    } else {
+      const double target = schedule_.target_frame_time();
+      const double now = pacing_clock_->now();
+      if (!has_deadline) {
+        next_deadline = now;
+        has_deadline = true;
+      }
+      next_deadline += target;
+
+      if (next_deadline > now) {
+        on_throttle_wait(next_deadline - now);
+      }
+
+      // After a severe stall, resynchronize instead of accumulating an unbounded
+      // catch-up backlog. Small oversleeps intentionally shorten the next wait.
+      const double after = pacing_clock_->now();
+      if (after - next_deadline > target) {
+        next_deadline = after;
       }
     }
 
@@ -64,9 +104,15 @@ void frame_pipeline::run() {
 }
 
 bool frame_pipeline::step_frame(double frame_delta) {
-  if (should_quit()) {
+  if (should_quit() || stepping_) {
     return false;
   }
+
+  struct stepping_guard {
+    explicit stepping_guard(bool& flag) : flag_(flag) { flag_ = true; }
+    ~stepping_guard() { flag_ = false; }
+    bool& flag_;
+  } guard(stepping_);
 
   on_poll();
   if (should_quit()) {
@@ -81,10 +127,28 @@ bool frame_pipeline::step_frame(double frame_delta) {
   }
 
   for (const std::size_t index : update_order_) {
+    if (!stages_[index].options.enabled) {
+      continue;
+    }
     stages_[index].stage->on_frame_begin(frame_delta);
     if (should_quit()) {
       return false;
     }
+  }
+
+  for (std::size_t index = 0; index < stages_.size(); ++index) {
+    const stage_entry& entry = stages_[index];
+    frame_stage_stats& stage = stage_stats_[index];
+    stage.clock_delta = entry.clock ? entry.clock->delta() : 0.0;
+    stage.group = entry.options.group;
+    stage.enabled = entry.options.enabled;
+    stage.receive_update = entry.options.receive_update;
+    stage.receive_render = entry.options.receive_render;
+    stage.update_time = 0.0;
+    stage.render_time = 0.0;
+    stage.fixed_steps = 0;
+    stage.alpha = entry.last_alpha;
+    stage.tick = entry.tick;
   }
 
   int fixed_steps = 0;
@@ -92,19 +156,26 @@ bool frame_pipeline::step_frame(double frame_delta) {
   const clock_type::time_point logic_start = clock_type::now();
   for (const std::size_t index : update_order_) {
     stage_entry& entry = stages_[index];
-    if (!entry.options.receive_update) {
+    frame_stage_stats& stage = stage_stats_[index];
+
+    if (!entry.options.enabled || !entry.options.receive_update) {
       continue;
     }
 
     const double stage_delta = entry.clock ? entry.clock->delta() : 0.0;
+    const clock_type::time_point stage_start = clock_type::now();
 
     if (entry.stage->use_fixed_step()) {
+      // Resolve the step once so a schedule change cannot split one batch of
+      // logic steps across two different dt values.
+      const double logic_step = entry.scheduler.logic_step();
       const step_result result = entry.scheduler.step(stage_delta);
       fixed_steps += result.logic_steps;
       entry.last_alpha = result.alpha;
+      stage.fixed_steps = result.logic_steps;
 
       for (int i = 0; i < result.logic_steps; ++i) {
-        entry.stage->on_update(entry.scheduler.logic_step(), entry.tick++);
+        entry.stage->on_update(logic_step, entry.tick++);
         ++tick_;
 
         if (should_quit()) {
@@ -116,6 +187,10 @@ bool frame_pipeline::step_frame(double frame_delta) {
       ++tick_;
       entry.last_alpha = 1.0;
     }
+
+    stage.update_time = seconds_between(stage_start, clock_type::now());
+    stage.alpha = entry.last_alpha;
+    stage.tick = entry.tick;
 
     if (should_quit()) {
       break;
@@ -132,6 +207,9 @@ bool frame_pipeline::step_frame(double frame_delta) {
 
   if (!should_quit()) {
     for (const std::size_t index : render_order_) {
+      if (!stages_[index].options.enabled) {
+        continue;
+      }
       stages_[index].stage->on_render_frame_begin();
       if (should_quit()) {
         break;
@@ -142,12 +220,14 @@ bool frame_pipeline::step_frame(double frame_delta) {
   if (!should_quit()) {
     for (const std::size_t index : render_order_) {
       stage_entry& entry = stages_[index];
-      if (!entry.options.receive_render) {
+      if (!entry.options.enabled || !entry.options.receive_render) {
         continue;
       }
 
+      const clock_type::time_point stage_start = clock_type::now();
       const double stage_delta = entry.clock ? entry.clock->delta() : 0.0;
       entry.stage->on_render(entry.last_alpha, stage_delta);
+      stage_stats_[index].render_time = seconds_between(stage_start, clock_type::now());
 
       if (should_quit()) {
         break;
@@ -156,6 +236,9 @@ bool frame_pipeline::step_frame(double frame_delta) {
   }
 
   for (const std::size_t index : render_order_) {
+    if (!stages_[index].options.enabled) {
+      continue;
+    }
     stages_[index].stage->on_render_frame_end();
   }
   on_render_frame_end();
@@ -181,7 +264,7 @@ void frame_pipeline::on_render_frame_end() noexcept {}
 
 void frame_pipeline::on_throttle_wait(double seconds) {
   if (std::isfinite(seconds) && seconds > 0.0) {
-    std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+    pacing_clock_->sleep_until(pacing_clock_->now() + seconds);
   }
 }
 
@@ -195,12 +278,39 @@ clock_tree& frame_pipeline::clocks() noexcept { return *clock_tree_; }
 
 const clock_tree& frame_pipeline::clocks() const noexcept { return *clock_tree_; }
 
+frame_clock& frame_pipeline::pacing_clock() noexcept { return *pacing_clock_; }
+
+const frame_clock& frame_pipeline::pacing_clock() const noexcept { return *pacing_clock_; }
+
+const std::vector<frame_stage_stats>& frame_pipeline::stage_stats() const noexcept { return stage_stats_; }
+
 uint64_t frame_pipeline::tick_count() const noexcept { return tick_; }
+
+uint64_t frame_pipeline::stage_id(std::string_view name) const noexcept {
+  const auto it = std::find_if(stages_.begin(), stages_.end(), [name](const stage_entry& entry) {
+    return entry.name == name;
+  });
+  return it == stages_.end() ? invalid_stage_id : it->id;
+}
+
+std::expected<frame_stage_options, std::error_code>
+frame_pipeline::stage_options(std::string_view name) const noexcept {
+  const auto it = std::find_if(stages_.begin(), stages_.end(), [name](const stage_entry& entry) {
+    return entry.name == name;
+  });
+  if (it == stages_.end()) {
+    return std::unexpected(std::make_error_code(std::errc::no_such_file_or_directory));
+  }
+  return it->options;
+}
 
 std::expected<void, std::error_code> frame_pipeline::add_stage(std::string_view name,
                                                                std::unique_ptr<frame_stage> stage,
                                                                std::shared_ptr<clock_node> clock,
                                                                frame_stage_options options) {
+  if (stepping_) {
+    return std::unexpected(std::make_error_code(std::errc::operation_in_progress));
+  }
   if (name.empty() || !stage) {
     return std::unexpected(std::make_error_code(std::errc::invalid_argument));
   }
@@ -212,12 +322,22 @@ std::expected<void, std::error_code> frame_pipeline::add_stage(std::string_view 
     clock = clock_tree_->root();
   }
 
-  stages_.push_back(stage_entry{ std::string(name), std::move(stage), std::move(clock), options, &schedule_ });
+  stages_.push_back(stage_entry{ std::string(name),
+                                 std::move(stage),
+                                 std::move(clock),
+                                 options,
+                                 next_stage_id_++,
+                                 make_stage_scheduler(schedule_, options) });
   rebuild_order_lists();
+  rebuild_stage_stats();
   return {};
 }
 
 std::expected<void, std::error_code> frame_pipeline::erase_stage(std::string_view name) {
+  if (stepping_) {
+    return std::unexpected(std::make_error_code(std::errc::operation_in_progress));
+  }
+
   const auto it = std::find_if(stages_.begin(), stages_.end(), [name](const stage_entry& entry) {
     return entry.name == name;
   });
@@ -227,13 +347,84 @@ std::expected<void, std::error_code> frame_pipeline::erase_stage(std::string_vie
 
   stages_.erase(it);
   rebuild_order_lists();
+  rebuild_stage_stats();
   return {};
 }
 
+std::expected<void, std::error_code> frame_pipeline::set_stage_options(std::string_view name,
+                                                                       frame_stage_options options) {
+  if (stepping_) {
+    return std::unexpected(std::make_error_code(std::errc::operation_in_progress));
+  }
+
+  const auto it = std::find_if(stages_.begin(), stages_.end(), [name](const stage_entry& entry) {
+    return entry.name == name;
+  });
+  if (it == stages_.end()) {
+    return std::unexpected(std::make_error_code(std::errc::no_such_file_or_directory));
+  }
+
+  const frame_stage_options previous = it->options;
+  const bool scheduler_changed = previous.target_logic_hz != options.target_logic_hz ||
+                                 previous.max_frame_time != options.max_frame_time ||
+                                 previous.max_logic_steps_per_frame != options.max_logic_steps_per_frame;
+
+  it->options = options;
+  if (scheduler_changed) {
+    it->scheduler = make_stage_scheduler(schedule_, options);
+    it->last_alpha = 0.0;
+  }
+
+  rebuild_order_lists();
+  rebuild_stage_stats();
+  return {};
+}
+
+std::expected<void, std::error_code> frame_pipeline::set_stage_enabled(std::string_view name, bool enabled) {
+  if (stepping_) {
+    return std::unexpected(std::make_error_code(std::errc::operation_in_progress));
+  }
+
+  const auto it = std::find_if(stages_.begin(), stages_.end(), [name](const stage_entry& entry) {
+    return entry.name == name;
+  });
+  if (it == stages_.end()) {
+    return std::unexpected(std::make_error_code(std::errc::no_such_file_or_directory));
+  }
+
+  if (it->options.enabled != enabled) {
+    it->options.enabled = enabled;
+    rebuild_stage_stats();
+  }
+  return {};
+}
+
+std::size_t frame_pipeline::set_group_enabled(int group, bool enabled) {
+  if (stepping_) {
+    return 0;
+  }
+
+  std::size_t changed = 0;
+  for (stage_entry& entry : stages_) {
+    if (entry.options.group == group && entry.options.enabled != enabled) {
+      entry.options.enabled = enabled;
+      ++changed;
+    }
+  }
+  if (changed != 0) {
+    rebuild_stage_stats();
+  }
+  return changed;
+}
+
 void frame_pipeline::clear_stages() noexcept {
+  if (stepping_) {
+    return;
+  }
   stages_.clear();
   update_order_.clear();
   render_order_.clear();
+  stage_stats_.clear();
 }
 
 std::size_t frame_pipeline::stage_count() const noexcept { return stages_.size(); }
@@ -266,6 +457,36 @@ void frame_pipeline::rebuild_order_lists() {
     }
     return lhs < rhs;
   });
+}
+
+void frame_pipeline::rebuild_stage_stats() {
+  std::vector<frame_stage_stats> next(stages_.size());
+
+  for (std::size_t i = 0; i < stages_.size(); ++i) {
+    const stage_entry& entry = stages_[i];
+    frame_stage_stats& snapshot = next[i];
+    snapshot.name = entry.name;
+    snapshot.stage_id = entry.id;
+    snapshot.group = entry.options.group;
+    snapshot.enabled = entry.options.enabled;
+    snapshot.receive_update = entry.options.receive_update;
+    snapshot.receive_render = entry.options.receive_render;
+
+    const auto previous =
+        std::find_if(stage_stats_.begin(), stage_stats_.end(), [&entry](const frame_stage_stats& old) {
+          return old.stage_id == entry.id;
+        });
+    if (previous != stage_stats_.end()) {
+      snapshot.update_time = previous->update_time;
+      snapshot.render_time = previous->render_time;
+      snapshot.fixed_steps = previous->fixed_steps;
+      snapshot.alpha = previous->alpha;
+      snapshot.clock_delta = previous->clock_delta;
+      snapshot.tick = previous->tick;
+    }
+  }
+
+  stage_stats_ = std::move(next);
 }
 
 void frame_pipeline::refresh_budget() noexcept { stats_.set_budget(fallback_budget(schedule_)); }

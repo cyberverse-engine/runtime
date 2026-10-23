@@ -23,6 +23,7 @@
 
 #include "cyberverse/runtime/clock_node.hpp"
 #include "cyberverse/runtime/clock_tree.hpp"
+#include "cyberverse/runtime/frame_clock.hpp"
 #include "cyberverse/runtime/frame_schedule.hpp"
 #include "cyberverse/runtime/frame_stage.hpp"
 #include "cyberverse/runtime/frame_stats.hpp"
@@ -39,10 +40,13 @@ namespace runtime {
  * update late but render early.
  *
  * `receive_update` / `receive_render` gate only the corresponding action:
- * `on_update` and `on_render`. Frame lifecycle hooks
- * (@ref frame_stage::on_frame_begin,
- * @ref frame_stage::on_render_frame_begin, and
- * @ref frame_stage::on_render_frame_end) still run for every registered stage.
+ * `on_update` and `on_render`. Frame lifecycle hooks still run for every
+ * enabled stage. `enabled == false` disables every stage callback, including
+ * lifecycle hooks, without removing the stage.
+ *
+ * `target_logic_hz`, `max_frame_time`, and `max_logic_steps_per_frame` override
+ * the pipeline's fixed-step configuration for this stage. Non-positive values
+ * inherit the pipeline schedule.
  */
 struct frame_stage_options {
   /** Update priority; lower runs first, ties keep registration order. */
@@ -56,6 +60,21 @@ struct frame_stage_options {
 
   /** When false, the pipeline skips this stage's on_render. */
   bool receive_render = true;
+
+  /** When false, no stage callbacks run and no update/render time is recorded. */
+  bool enabled = true;
+
+  /** Opaque group used by @ref frame_pipeline::set_group_enabled and telemetry. */
+  int group = 0;
+
+  /** Fixed logic frequency override; `<= 0` inherits the pipeline schedule. */
+  double target_logic_hz = 0.0;
+
+  /** Fixed max frame-time override; `<= 0` inherits the pipeline schedule. */
+  double max_frame_time = 0.0;
+
+  /** Fixed catch-up step limit override; `<= 0` inherits the pipeline schedule. */
+  int max_logic_steps_per_frame = 0;
 };
 
 /**
@@ -76,16 +95,21 @@ struct frame_stage_options {
  * Frame order:
  * 1. `on_poll()`.
  * 2. Update the clock tree with the frame delta.
- * 3. `on_frame_begin(frame_delta)`, then every stage's `on_frame_begin`.
- * 4. Update every stage in `update_order` (skipping `receive_update == false`).
- * 5. `on_render_frame_begin()`, then every stage's `on_render_frame_begin`.
- * 6. Render every stage in `render_order` (skipping `receive_render == false`).
- * 7. Every stage's `on_render_frame_end()`, then `on_render_frame_end()`.
+ * 3. `on_frame_begin(frame_delta)`, then every enabled stage's `on_frame_begin`.
+ * 4. Update every enabled stage in `update_order` (skipping `receive_update ==
+ *    false`).
+ * 5. `on_render_frame_begin()`, then every enabled stage's
+ *    `on_render_frame_begin`.
+ * 6. Render every enabled stage in `render_order` (skipping `receive_render ==
+ *    false`).
+ * 7. Every enabled stage's `on_render_frame_end()`, then
+ *    `on_render_frame_end()`.
  * 8. `on_present()`.
- * 9. Record statistics and run automatic pacing.
+ * 9. Record statistics, stage snapshots, and automatic pacing.
  *
- * Lifecycle hooks run for every registered stage, even when the corresponding
- * receive flag is false. Ties in either order keep stage registration order.
+ * Lifecycle hooks run for every enabled stage, even when the corresponding
+ * receive flag is false. Disabled stages run no callbacks. Ties in either order
+ * keep stage registration order.
  *
  * The loop is single-threaded, but @ref request_quit is safe to call from
  * another thread (for example a signal or window callback). Every other
@@ -94,13 +118,17 @@ struct frame_stage_options {
 class frame_pipeline {
 public:
   /**
-   * @brief Construct a pipeline around a schedule and clock tree.
+   * @brief Construct a pipeline around a schedule, clock tree, and pacing clock.
    *
    * @param schedule Render pacing and fixed-step configuration.
    * @param p_clock_tree Clock tree shared with the stages. A null pointer
    * creates a private tree.
+   * @param p_pacing_clock Monotonic clock used for wait deadlines. A null
+   * pointer creates a @ref steady_frame_clock.
    */
-  explicit frame_pipeline(frame_schedule schedule, std::shared_ptr<clock_tree> p_clock_tree = nullptr);
+  explicit frame_pipeline(frame_schedule schedule,
+                          std::shared_ptr<clock_tree> p_clock_tree = nullptr,
+                          std::shared_ptr<frame_clock> p_pacing_clock = nullptr);
 
   virtual ~frame_pipeline() = default;
 
@@ -155,7 +183,8 @@ public:
    * `run()` calls this once per iteration instead of reading a hard-coded
    * clock. Implementations may use `std::chrono::steady_clock`, a platform
    * timer, or a synthetic clock in tests. The first call may return zero.
-   * Negative and non-finite values are treated as zero by the runtime.
+   * Clock, scheduler, and statistics consumers sanitize negative or
+   * non-finite deltas to zero.
    */
   virtual double tick_clock() noexcept = 0;
 
@@ -192,8 +221,9 @@ public:
   /**
    * @brief Wait before presenting when the schedule is throttling.
    *
-   * The default implementation sleeps for the requested duration. Tests and
-   * custom platforms may override it to inject a synthetic wait.
+   * The default implementation advances @ref pacing_clock to
+   * `now() + seconds` with sleep-until. Tests and custom platforms may override
+   * it to inject a synthetic wait.
    *
    * @param seconds Positive wait duration in seconds.
    */
@@ -214,6 +244,55 @@ public:
   /** @brief Clock tree shared with the stages. */
   const clock_tree& clocks() const noexcept;
 
+  /** @brief Monotonic clock used for wait deadlines. */
+  frame_clock& pacing_clock() noexcept;
+
+  /** @brief Monotonic clock used for wait deadlines. */
+  const frame_clock& pacing_clock() const noexcept;
+
+  /** @brief Sentinel returned by @ref stage_id when no stage has the name. */
+  static constexpr uint64_t invalid_stage_id = 0;
+
+  /**
+   * @brief Per-stage snapshots for the latest frame.
+   *
+   * The vector is in registration order and is updated in place each frame.
+   * Querying it performs no allocation. The name views and the reference are
+   * invalidated by add/erase/clear or by another stage mutation.
+   */
+  const std::vector<frame_stage_stats>& stage_stats() const noexcept;
+
+  /** @brief Stable id of a stage, or @ref invalid_stage_id when absent. */
+  uint64_t stage_id(std::string_view name) const noexcept;
+
+  /** @brief Copy the current options of a stage. */
+  std::expected<frame_stage_options, std::error_code> stage_options(std::string_view name) const noexcept;
+
+  /**
+   * @brief Replace a stage's options.
+   *
+   * Changing a fixed-step override rebuilds the stage scheduler and clears its
+   * accumulator/alpha. Order, receive, enabled, and group changes take effect
+   * on the next frame. Returns `std::errc::no_such_file_or_directory` for an
+   * unknown stage and `std::errc::operation_in_progress` during a frame.
+   */
+  std::expected<void, std::error_code> set_stage_options(std::string_view name, frame_stage_options options);
+
+  /**
+   * @brief Enable or disable a stage without removing it.
+   *
+   * A disabled stage runs no callbacks, consumes no ticks, and records zero
+   * update/render time. `receive_*` flags are not modified.
+   */
+  std::expected<void, std::error_code> set_stage_enabled(std::string_view name, bool enabled);
+
+  /**
+   * @brief Enable or disable every stage in a group.
+   *
+   * @return Number of stages whose enabled flag changed; 0 during a frame.
+   */
+  std::size_t set_group_enabled(int group, bool enabled);
+
   /**
    * @brief Total number of stage update calls executed so far.
    *
@@ -227,10 +306,11 @@ public:
    * @brief Add a stage to the frame.
    *
    * The stage is inserted into the independent update and render order lists
-   * using @ref frame_stage_options. Ties keep registration order. The clock
-   * node must belong to (or be reachable from) this pipeline's clock tree; a
-   * null clock uses the root clock. The call is intended for setup or between
-   * frames, not from inside a stage callback.
+   * using @ref frame_stage_options. Ties keep registration order. Each stage
+   * receives a stable id and an independent scheduler built from the stage's
+   * fixed-step overrides. The clock node must belong to (or be reachable from)
+   * this pipeline's clock tree; a null clock uses the root clock. The call is
+   * intended for setup or between frames, not from inside a stage callback.
    *
    * Errors:
    * - `std::errc::invalid_argument` for an empty name or a null stage;
@@ -244,11 +324,17 @@ public:
   /**
    * @brief Remove a stage by name.
    *
-   * @return `std::errc::no_such_file_or_directory` when no stage has that name.
+   * @return `std::errc::no_such_file_or_directory` when no stage has that name,
+   * or `std::errc::operation_in_progress` during a frame.
    */
   std::expected<void, std::error_code> erase_stage(std::string_view name);
 
-  /** @brief Remove every stage. */
+  /**
+   * @brief Remove every stage.
+   *
+   * This is a no-op during a frame; use @ref set_stage_enabled or
+   * @ref set_group_enabled to disable stages at runtime.
+   */
   void clear_stages() noexcept;
 
   /** @brief Number of registered stages. */
@@ -263,17 +349,20 @@ private:
                 std::unique_ptr<frame_stage> stage_ptr,
                 std::shared_ptr<clock_node> clock_ptr,
                 frame_stage_options stage_options,
-                const frame_schedule* owner)
+                uint64_t stage_id,
+                frame_schedule::fixed_step_scheduler scheduler_value)
         : name(std::move(stage_name))
         , stage(std::move(stage_ptr))
         , clock(std::move(clock_ptr))
         , options(stage_options)
-        , scheduler(owner) {}
+        , id(stage_id)
+        , scheduler(std::move(scheduler_value)) {}
 
     std::string name;
     std::unique_ptr<frame_stage> stage;
     std::shared_ptr<clock_node> clock;
     frame_stage_options options;
+    uint64_t id = 0;
     frame_schedule::fixed_step_scheduler scheduler;
     double last_alpha = 0.0;
     uint64_t tick = 0;
@@ -284,14 +373,21 @@ private:
   /** @brief Rebuild both order index lists after a stage is added or removed. */
   void rebuild_order_lists();
 
+  /** @brief Rebuild stage-stat metadata while preserving numeric history by id. */
+  void rebuild_stage_stats();
+
   frame_schedule schedule_;
   frame_stats stats_;
   std::shared_ptr<clock_tree> clock_tree_;
+  std::shared_ptr<frame_clock> pacing_clock_;
   std::atomic<bool> quit_{ false };
+  bool stepping_ = false;
   uint64_t tick_ = 0;
+  uint64_t next_stage_id_ = 1;
   std::vector<stage_entry> stages_;
   std::vector<std::size_t> update_order_;
   std::vector<std::size_t> render_order_;
+  std::vector<frame_stage_stats> stage_stats_;
 };
 
 } // namespace runtime

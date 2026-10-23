@@ -25,6 +25,8 @@ clock_node::clock_node(std::string_view name) : name_(name) {}
 
 std::string_view clock_node::name() const noexcept { return name_; }
 
+bool clock_node::is_root() const noexcept { return parent_.expired(); }
+
 void clock_node::set_paused(bool paused) noexcept { local_paused_ = paused; }
 
 void clock_node::set_time_scale(double scale) noexcept {
@@ -69,8 +71,8 @@ void clock_node::update(double real_delta) noexcept {
 bool clock_node::contains(std::string_view name) const noexcept { return find_child(name) != nullptr; }
 
 std::shared_ptr<clock_node>& clock_node::ensure(std::string_view name) {
-  if (name.empty()) {
-    throw std::invalid_argument("clock_node::ensure: empty name");
+  if (name.empty() || name.find('/') != std::string_view::npos) {
+    throw std::invalid_argument("clock_node::ensure: invalid child name");
   }
 
   const auto it = std::find_if(children_.begin(), children_.end(), [name](const std::shared_ptr<clock_node>& child) {

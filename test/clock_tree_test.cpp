@@ -108,3 +108,141 @@ TEST_CASE("clock_tree sanitizes invalid deltas", "[runtime][clock]") {
   CHECK(node->delta() == Approx(0.0));
   CHECK(node->total_time() == Approx(0.0));
 }
+
+TEST_CASE("clock_tree validates paths", "[runtime][clock]") {
+  CHECK(clock_tree::is_valid_path(""));
+  CHECK(clock_tree::is_valid_path("/"));
+  CHECK(clock_tree::is_valid_path("game/ui"));
+  CHECK(clock_tree::is_valid_path("/game//ui/"));
+  CHECK_FALSE(clock_tree::is_valid_path("."));
+  CHECK_FALSE(clock_tree::is_valid_path(".."));
+  CHECK_FALSE(clock_tree::is_valid_path("game/../ui"));
+  CHECK_FALSE(clock_tree::is_valid_path("game/./ui"));
+  CHECK_FALSE(clock_tree::is_valid_path(std::string_view("game\0ui", 7)));
+
+  clock_tree tree;
+  CHECK(tree.ensure("..") == nullptr);
+  CHECK_FALSE(tree.contains(".."));
+}
+
+TEST_CASE("clock_tree global pause affects every clock", "[runtime][clock]") {
+  clock_tree tree;
+  auto game = tree.ensure("game");
+  auto ui = tree.ensure("ui");
+
+  tree.set_paused(true);
+  CHECK(tree.is_paused());
+  tree.update(1.0);
+  CHECK(game->delta() == Approx(0.0));
+  CHECK(ui->delta() == Approx(0.0));
+
+  tree.set_paused(false);
+  tree.update(0.5);
+  CHECK(game->delta() == Approx(0.5));
+  CHECK(ui->delta() == Approx(0.5));
+}
+
+TEST_CASE("clock_node total time stays continuous across scale changes", "[runtime][clock]") {
+  auto node = std::make_shared<clock_node>("slow");
+  node->set_time_scale(1.0);
+  node->update(0.5);
+  CHECK(node->total_time() == Approx(0.5));
+
+  node->set_time_scale(2.0);
+  node->update(0.25);
+  CHECK(node->delta() == Approx(0.5));
+  CHECK(node->total_time() == Approx(1.0));
+}
+
+TEST_CASE("clock_tree reparents nodes and rejects cycles", "[runtime][clock]") {
+  clock_tree tree;
+  auto game = tree.ensure("game");
+  auto ui = tree.ensure("game/ui");
+  auto audio = tree.ensure("audio");
+  tree.ensure("ui");
+
+  auto conflict = tree.reparent("game/ui", "");
+  REQUIRE_FALSE(conflict.has_value());
+  CHECK(conflict.error() == std::make_error_code(std::errc::file_exists));
+
+  auto cycle = tree.reparent("game", "game/ui");
+  REQUIRE_FALSE(cycle.has_value());
+  CHECK(cycle.error() == std::make_error_code(std::errc::invalid_argument));
+
+  auto missing = tree.reparent("missing", "audio");
+  REQUIRE_FALSE(missing.has_value());
+  CHECK(missing.error() == std::make_error_code(std::errc::invalid_argument));
+
+  CHECK(tree.reparent("", "audio").error() == std::make_error_code(std::errc::invalid_argument));
+
+  CHECK(tree.reparent("game/ui", "audio").has_value());
+  CHECK_FALSE(tree.contains("game/ui"));
+  CHECK(tree.lookup("audio/ui") == ui);
+  CHECK_FALSE(ui->is_root());
+
+  game->set_time_scale(2.0);
+  audio->set_time_scale(0.5);
+  tree.update(1.0);
+  CHECK(ui->delta() == Approx(0.5));
+}
+
+TEST_CASE("clock_tree clones subtrees", "[runtime][clock]") {
+  clock_tree tree;
+  auto game = tree.ensure("game");
+  game->set_paused(true);
+  game->set_time_scale(0.5);
+  tree.ensure("game/ui");
+
+  auto clone = tree.clone("game", "copy");
+  REQUIRE(clone.has_value());
+  CHECK(tree.contains("copy"));
+  CHECK(tree.contains("copy/ui"));
+  CHECK(tree.lookup("copy") == *clone);
+  CHECK((*clone)->is_paused_locally());
+  CHECK((*clone)->local_time_scale() == Approx(0.5));
+  CHECK((*clone)->total_time() == Approx(0.0));
+
+  auto duplicate = tree.clone("game", "copy");
+  REQUIRE_FALSE(duplicate.has_value());
+  CHECK(duplicate.error() == std::make_error_code(std::errc::file_exists));
+
+  auto missing = tree.clone("missing", "copy2");
+  REQUIRE_FALSE(missing.has_value());
+  CHECK(missing.error() == std::make_error_code(std::errc::invalid_argument));
+
+  auto nested = tree.clone("game", "game/nested");
+  REQUIRE_FALSE(nested.has_value());
+  CHECK(nested.error() == std::make_error_code(std::errc::invalid_argument));
+
+  tree.update(1.0);
+  CHECK((*clone)->total_time() == Approx(0.0));
+
+  tree.ensure("copy")->set_paused(false);
+  tree.ensure("copy")->set_time_scale(2.0);
+  tree.update(0.25);
+  CHECK(tree.ensure("copy")->delta() == Approx(0.5));
+  CHECK(tree.ensure("game")->delta() == Approx(0.0));
+}
+
+TEST_CASE("clock_tree snapshots and exports", "[runtime][clock]") {
+  clock_tree tree;
+  tree.ensure("game");
+  tree.ensure("game/ui");
+  tree.update(0.5);
+
+  const auto snapshot = tree.snapshot();
+  REQUIRE(snapshot.size() == 3);
+  CHECK(snapshot[0].path.empty());
+  CHECK(snapshot[0].name == "root");
+  CHECK(snapshot[1].path == "game");
+  CHECK(snapshot[2].path == "game/ui");
+  CHECK(snapshot[2].delta == Approx(0.5));
+
+  const std::string text = tree.to_text();
+  CHECK(text.find("path=/") != std::string::npos);
+  CHECK(text.find("path=game/ui") != std::string::npos);
+
+  const std::string json = tree.to_json();
+  CHECK(json.find("\"name\":\"root\"") != std::string::npos);
+  CHECK(json.find("\"path\":\"game/ui\"") != std::string::npos);
+}

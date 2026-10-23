@@ -3,13 +3,14 @@
  * @author simon2077s (simon2077s@gmail.com)
  * @brief Frame stats implementation
  * @version 0.1
- * @date 2026-10-22
+ * @date 2026-10-23
  *
  * @copyright Copyright (c) 2026
  *
  */
 #include "cyberverse/runtime/frame_stats.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 namespace cyberverse::runtime {
@@ -22,9 +23,10 @@ double sanitize_time(double value) { return std::isfinite(value) && value > 0.0 
 
 } // namespace
 
-frame_stats::frame_stats(double ema_alpha, double budget) noexcept
+frame_stats::frame_stats(double ema_alpha, double budget, std::size_t window_size) noexcept
     : ema_alpha_(std::isfinite(ema_alpha) && ema_alpha > 0.0 && ema_alpha <= 1.0 ? ema_alpha : kDefaultEmaAlpha)
-    , budget_(std::isfinite(budget) && budget > 0.0 ? budget : kDefaultBudget) {}
+    , budget_(std::isfinite(budget) && budget > 0.0 ? budget : kDefaultBudget)
+    , window_capacity_(std::clamp(window_size, std::size_t{ 1 }, max_window_size)) {}
 
 void frame_stats::record_frame(const frame_sample& sample) noexcept {
   const double frame_time = sanitize_time(sample.frame_time);
@@ -32,6 +34,7 @@ void frame_stats::record_frame(const frame_sample& sample) noexcept {
   const double render_time = sanitize_time(sample.render_time);
 
   ++total_frames_;
+  record_window_sample(frame_time);
 
   if (!has_sample_) {
     smoothed_frame_time_ = frame_time;
@@ -61,6 +64,12 @@ void frame_stats::record_frame(const frame_sample& sample) noexcept {
   }
 }
 
+void frame_stats::record_window_sample(double frame_time) noexcept {
+  window_[window_next_] = frame_time;
+  window_next_ = (window_next_ + 1) % window_capacity_;
+  window_count_ = std::min(window_count_ + 1, window_capacity_);
+}
+
 void frame_stats::reset() noexcept {
   smoothed_frame_time_ = 0.0;
   smoothed_logic_time_ = 0.0;
@@ -69,6 +78,8 @@ void frame_stats::reset() noexcept {
   jitter_streak_ = 0;
   over_budget_streak_ = 0;
   has_sample_ = false;
+  window_count_ = 0;
+  window_next_ = 0;
 }
 
 double frame_stats::smoothed_frame_time() const noexcept { return smoothed_frame_time_; }
@@ -104,5 +115,66 @@ void frame_stats::set_budget(double seconds) noexcept {
 }
 
 double frame_stats::budget() const noexcept { return budget_; }
+
+double frame_stats::min_frame_time() const noexcept {
+  if (window_count_ == 0) {
+    return 0.0;
+  }
+
+  const std::size_t start = (window_next_ + window_capacity_ - window_count_) % window_capacity_;
+  double result = window_[start];
+  for (std::size_t i = 1; i < window_count_; ++i) {
+    result = std::min(result, window_[(start + i) % window_capacity_]);
+  }
+  return result;
+}
+
+double frame_stats::max_frame_time() const noexcept {
+  if (window_count_ == 0) {
+    return 0.0;
+  }
+
+  const std::size_t start = (window_next_ + window_capacity_ - window_count_) % window_capacity_;
+  double result = window_[start];
+  for (std::size_t i = 1; i < window_count_; ++i) {
+    result = std::max(result, window_[(start + i) % window_capacity_]);
+  }
+  return result;
+}
+
+double frame_stats::percentile(double p) const noexcept {
+  if (window_count_ == 0) {
+    return 0.0;
+  }
+  if (!std::isfinite(p) || p <= 0.0) {
+    return min_frame_time();
+  }
+  if (p >= 1.0) {
+    return max_frame_time();
+  }
+
+  std::array<double, max_window_size> sorted{};
+  const std::size_t start = (window_next_ + window_capacity_ - window_count_) % window_capacity_;
+  for (std::size_t i = 0; i < window_count_; ++i) {
+    sorted[i] = window_[(start + i) % window_capacity_];
+  }
+  std::sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(window_count_));
+
+  const double rank = p * static_cast<double>(window_count_ - 1);
+  const auto lower = static_cast<std::size_t>(std::floor(rank));
+  const auto upper = static_cast<std::size_t>(std::ceil(rank));
+  if (lower == upper) {
+    return sorted[lower];
+  }
+
+  const double fraction = rank - static_cast<double>(lower);
+  return sorted[lower] * (1.0 - fraction) + sorted[upper] * fraction;
+}
+
+double frame_stats::budget_margin() const noexcept { return budget_ - smoothed_frame_time_; }
+
+std::size_t frame_stats::window_size() const noexcept { return window_capacity_; }
+
+std::size_t frame_stats::window_sample_count() const noexcept { return window_count_; }
 
 } // namespace cyberverse::runtime

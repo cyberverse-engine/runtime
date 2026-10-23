@@ -11,6 +11,7 @@ set(
   cyberverse/runtime.hpp
   cyberverse/runtime/clock_node.hpp
   cyberverse/runtime/clock_tree.hpp
+  cyberverse/runtime/frame_clock.hpp
   cyberverse/runtime/frame_pipeline.hpp
   cyberverse/runtime/frame_schedule.hpp
   cyberverse/runtime/frame_stage.hpp
@@ -22,6 +23,7 @@ set(
   SOURCE_FILES
   cyberverse/runtime/clock_node.cpp
   cyberverse/runtime/clock_tree.cpp
+  cyberverse/runtime/frame_clock.cpp
   cyberverse/runtime/frame_pipeline.cpp
   cyberverse/runtime/frame_schedule.cpp
   cyberverse/runtime/frame_stage.cpp

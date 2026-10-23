@@ -1,6 +1,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -8,6 +9,7 @@
 #include <vector>
 
 #include "cyberverse/runtime/clock_tree.hpp"
+#include "cyberverse/runtime/frame_clock.hpp"
 #include "cyberverse/runtime/frame_pipeline.hpp"
 #include "cyberverse/runtime/frame_schedule.hpp"
 #include "cyberverse/runtime/frame_stage.hpp"
@@ -15,6 +17,7 @@
 using Catch::Approx;
 using cyberverse::runtime::clock_node;
 using cyberverse::runtime::clock_tree;
+using cyberverse::runtime::frame_clock;
 using cyberverse::runtime::frame_pipeline;
 using cyberverse::runtime::frame_schedule;
 using cyberverse::runtime::frame_stage;
@@ -22,6 +25,23 @@ using cyberverse::runtime::frame_stage_options;
 using cyberverse::runtime::schedule_config;
 
 namespace {
+
+class manual_frame_clock final : public frame_clock {
+public:
+  double now() noexcept override { return now_; }
+
+  void sleep_until(double deadline) override {
+    if (deadline > now_) {
+      now_ = deadline;
+      ++sleeps;
+    }
+  }
+
+  void advance(double seconds) { now_ += seconds; }
+
+  double now_ = 0.0;
+  int sleeps = 0;
+};
 
 class test_stage final : public frame_stage {
 public:
@@ -63,6 +83,9 @@ public:
     if (owner && quit_after_updates >= 0 && updates >= quit_after_updates) {
       owner->request_quit();
     }
+    if (update_hook) {
+      update_hook();
+    }
   }
 
   void on_render(double alpha, double dt) override {
@@ -83,6 +106,7 @@ public:
   frame_pipeline* owner = nullptr;
   std::vector<std::string>* events = nullptr;
   std::vector<std::string>* lifecycle = nullptr;
+  std::function<void()> update_hook;
   std::string name;
   int frame_begins = 0;
   int render_frame_begins = 0;
@@ -101,8 +125,10 @@ public:
 
 class test_pipeline final : public frame_pipeline {
 public:
-  explicit test_pipeline(frame_schedule schedule, std::shared_ptr<clock_tree> tree = nullptr)
-      : frame_pipeline(std::move(schedule), std::move(tree)) {}
+  explicit test_pipeline(frame_schedule schedule,
+                         std::shared_ptr<clock_tree> tree = nullptr,
+                         std::shared_ptr<frame_clock> pacing = nullptr)
+      : frame_pipeline(std::move(schedule), std::move(tree), std::move(pacing)) {}
 
   double tick_clock() noexcept override {
     ++clock_calls;
@@ -155,7 +181,11 @@ public:
 
   void on_throttle_wait(double seconds) override {
     ++waits;
+    wait_times.push_back(seconds);
     last_wait = seconds;
+    if (manual_clock) {
+      manual_clock->advance(seconds + oversleep);
+    }
   }
 
   int polls = 0;
@@ -168,9 +198,12 @@ public:
   double next_delta = 1.0 / 60.0;
   double last_wait = -1.0;
   double last_frame_delta = -1.0;
+  double oversleep = 0.0;
+  manual_frame_clock* manual_clock = nullptr;
   bool external_quit = false;
   int quit_after_polls = -1;
   int quit_after_presents = -1;
+  std::vector<double> wait_times;
   std::vector<std::string>* lifecycle = nullptr;
 };
 
@@ -584,7 +617,9 @@ TEST_CASE("frame_pipeline run loop uses tick_clock and stops at quit", "[runtime
 
 TEST_CASE("frame_pipeline run loop throttles with tick_clock deltas", "[runtime][pipeline]") {
   auto tree = std::make_shared<clock_tree>();
-  test_pipeline pipeline(frame_schedule{}, tree);
+  auto pacing = std::make_shared<manual_frame_clock>();
+  test_pipeline pipeline(frame_schedule{}, tree, pacing);
+  pipeline.manual_clock = pacing.get();
   add_stage(pipeline, "game", true, tree->ensure("game"));
   pipeline.next_delta = 0.001;
   pipeline.quit_after_polls = 2;
@@ -592,9 +627,9 @@ TEST_CASE("frame_pipeline run loop throttles with tick_clock deltas", "[runtime]
   pipeline.run();
 
   CHECK(pipeline.clock_calls == 2);
-  CHECK(pipeline.waits >= 1);
-  CHECK(pipeline.last_wait > 0.0);
-  CHECK(pipeline.last_wait < 1.0 / 60.0);
+  REQUIRE(pipeline.waits == 2);
+  CHECK(pipeline.wait_times[0] == Approx(1.0 / 60.0));
+  CHECK(pipeline.wait_times[1] == Approx(1.0 / 60.0));
 }
 
 TEST_CASE("frame_pipeline updates the statistics budget with the target rate", "[runtime][pipeline]") {
@@ -623,4 +658,279 @@ TEST_CASE("frame_pipeline feeds statistics into adaptive pacing", "[runtime][pip
 
   CHECK(pipeline.schedule().target_render_hz() < pipeline.schedule().desired_render_hz());
   CHECK(pipeline.schedule().target_render_hz() >= pipeline.schedule().config().min_render_hz);
+}
+
+TEST_CASE("frame_pipeline exposes per-stage statistics", "[runtime][pipeline][stats]") {
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+  auto* game = add_stage(pipeline, "game", true, tree->ensure("game"));
+  auto* ui = add_stage(pipeline, "ui", false, tree->ensure("ui"));
+
+  CHECK(pipeline.step_frame(0.05));
+
+  const auto& stats = pipeline.stage_stats();
+  REQUIRE(stats.size() == 2);
+  CHECK(stats[0].name == "game");
+  CHECK(stats[0].stage_id != frame_pipeline::invalid_stage_id);
+  CHECK(stats[0].stage_id == pipeline.stage_id("game"));
+  CHECK(stats[0].fixed_steps == 3);
+  CHECK(stats[0].alpha == Approx(0.0).margin(1e-6));
+  CHECK(stats[0].clock_delta == Approx(0.05));
+  CHECK(stats[0].tick == 3);
+  CHECK(stats[0].update_time >= 0.0);
+  CHECK(stats[0].render_time >= 0.0);
+
+  CHECK(stats[1].name == "ui");
+  CHECK(stats[1].stage_id == pipeline.stage_id("ui"));
+  CHECK(stats[1].fixed_steps == 0);
+  CHECK(stats[1].alpha == Approx(1.0));
+  CHECK(stats[1].clock_delta == Approx(0.05));
+  CHECK(stats[1].tick == 1);
+
+  CHECK(pipeline.stage_id("missing") == frame_pipeline::invalid_stage_id);
+  CHECK(game->updates == 3);
+  CHECK(ui->updates == 1);
+}
+
+TEST_CASE("frame_pipeline updates stage options and keeps stable ids", "[runtime][pipeline][stage]") {
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+  std::vector<std::string> events;
+
+  auto* a = add_stage(pipeline, "a", true, tree->ensure("a"), {}, &events);
+  auto* b = add_stage(pipeline, "b", true, tree->ensure("b"), {}, &events);
+
+  const uint64_t a_id = pipeline.stage_id("a");
+  REQUIRE(a_id != frame_pipeline::invalid_stage_id);
+
+  auto options = pipeline.stage_options("a");
+  REQUIRE(options.has_value());
+  options->update_order = -1;
+  options->render_order = 1;
+  CHECK(pipeline.set_stage_options("a", *options).has_value());
+
+  CHECK(pipeline.step_frame(1.0 / 60.0));
+  CHECK(events == std::vector<std::string>{ "a:u", "b:u", "b:r", "a:r" });
+  CHECK(pipeline.stage_id("a") == a_id);
+
+  events.clear();
+  CHECK(pipeline.set_stage_enabled("a", false).has_value());
+  CHECK(pipeline.step_frame(1.0 / 60.0));
+  CHECK(events == std::vector<std::string>{ "b:u", "b:r" });
+  CHECK(pipeline.stage_stats()[0].enabled == false);
+  CHECK(pipeline.stage_stats()[0].fixed_steps == 0);
+  CHECK(a->updates == 1);
+  CHECK(b->updates == 2);
+
+  CHECK(pipeline.set_stage_enabled("a", true).has_value());
+  events.clear();
+  CHECK(pipeline.step_frame(1.0 / 60.0));
+  CHECK(events == std::vector<std::string>{ "a:u", "b:u", "b:r", "a:r" });
+
+  CHECK(pipeline.erase_stage("a").has_value());
+  add_stage(pipeline, "a", true, tree->ensure("a"));
+  CHECK(pipeline.stage_id("a") != a_id);
+
+  auto missing = pipeline.stage_options("missing");
+  REQUIRE_FALSE(missing.has_value());
+  CHECK(missing.error() == std::make_error_code(std::errc::no_such_file_or_directory));
+  CHECK_FALSE(pipeline.set_stage_options("missing", {}).has_value());
+  CHECK_FALSE(pipeline.set_stage_enabled("missing", true).has_value());
+}
+
+TEST_CASE("frame_pipeline groups can be enabled and disabled together", "[runtime][pipeline][stage]") {
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+
+  frame_stage_options group_a;
+  group_a.group = 7;
+  frame_stage_options group_b;
+  group_b.group = 7;
+  frame_stage_options other;
+  other.group = 9;
+
+  add_stage(pipeline, "a", true, tree->ensure("a"), group_a);
+  add_stage(pipeline, "b", true, tree->ensure("b"), group_b);
+  add_stage(pipeline, "c", true, tree->ensure("c"), other);
+
+  CHECK(pipeline.set_group_enabled(7, false) == 2);
+  CHECK(pipeline.step_frame(1.0 / 60.0));
+  CHECK(pipeline.stage_stats()[0].enabled == false);
+  CHECK(pipeline.stage_stats()[1].enabled == false);
+  CHECK(pipeline.stage_stats()[2].enabled == true);
+
+  CHECK(pipeline.set_group_enabled(7, true) == 2);
+  CHECK(pipeline.step_frame(1.0 / 60.0));
+  CHECK(pipeline.stage_stats()[0].enabled == true);
+  CHECK(pipeline.stage_stats()[1].enabled == true);
+}
+
+TEST_CASE("frame_pipeline rejects stage mutation during a frame", "[runtime][pipeline][stage]") {
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+  auto* game = add_stage(pipeline, "game", true, tree->ensure("game"));
+
+  bool add_rejected = false;
+  bool erase_rejected = false;
+  bool options_rejected = false;
+  bool group_rejected = false;
+
+  game->update_hook = [&] {
+    auto add = pipeline.add_stage("extra", std::make_unique<test_stage>(true), nullptr, {});
+    add_rejected = !add.has_value() && add.error() == std::make_error_code(std::errc::operation_in_progress);
+
+    auto erase = pipeline.erase_stage("game");
+    erase_rejected = !erase.has_value() && erase.error() == std::make_error_code(std::errc::operation_in_progress);
+
+    auto options = pipeline.stage_options("game");
+    if (options.has_value()) {
+      auto set = pipeline.set_stage_options("game", *options);
+      options_rejected = !set.has_value() && set.error() == std::make_error_code(std::errc::operation_in_progress);
+    }
+
+    group_rejected = pipeline.set_group_enabled(0, false) == 0;
+    pipeline.clear_stages();
+  };
+
+  CHECK(pipeline.step_frame(1.0 / 60.0));
+  CHECK(add_rejected);
+  CHECK(erase_rejected);
+  CHECK(options_rejected);
+  CHECK(group_rejected);
+  CHECK(pipeline.stage_count() == 1);
+  CHECK(pipeline.has_stage("game"));
+}
+
+TEST_CASE("frame_pipeline supports per-stage fixed frequencies", "[runtime][pipeline][stage]") {
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+
+  frame_stage_options physics_options;
+  physics_options.target_logic_hz = 120.0;
+  auto* game = add_stage(pipeline, "game", true, tree->ensure("game"));
+  auto* physics = add_stage(pipeline, "physics", true, tree->ensure("physics"), physics_options);
+
+  CHECK(pipeline.step_frame(1.0 / 60.0));
+  CHECK(game->updates == 1);
+  CHECK(physics->updates == 2);
+  CHECK(game->last_dt == Approx(1.0 / 60.0));
+  CHECK(physics->last_dt == Approx(1.0 / 120.0));
+  CHECK(pipeline.stage_stats()[0].fixed_steps == 1);
+  CHECK(pipeline.stage_stats()[1].fixed_steps == 2);
+
+  frame_stage_options limited_options;
+  limited_options.max_logic_steps_per_frame = 1;
+  limited_options.max_frame_time = 1.0;
+  auto* limited = add_stage(pipeline, "limited", true, tree->ensure("limited"), limited_options);
+  CHECK(pipeline.step_frame(0.05));
+  CHECK(limited->updates == 1);
+  const auto& stats = pipeline.stage_stats();
+  CHECK(stats[2].fixed_steps == 1);
+}
+
+TEST_CASE("frame_pipeline stages inherit schedule logic changes live", "[runtime][pipeline][stage]") {
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+
+  frame_stage_options physics_options;
+  physics_options.target_logic_hz = 30.0;
+  auto* game = add_stage(pipeline, "game", true, tree->ensure("game"));
+  auto* physics = add_stage(pipeline, "physics", true, tree->ensure("physics"), physics_options);
+
+  CHECK(pipeline.step_frame(1.0 / 60.0));
+  CHECK(game->updates == 1);
+  CHECK(physics->updates == 0);
+
+  pipeline.schedule().target_logic_hz(120.0);
+
+  CHECK(pipeline.step_frame(1.0 / 60.0));
+  CHECK(game->updates == 3);
+  CHECK(physics->updates == 1);
+  CHECK(physics->last_dt == Approx(1.0 / 30.0));
+
+  pipeline.schedule().max_logic_steps_per_frame(1);
+  pipeline.schedule().max_frame_time(0.01);
+
+  CHECK(pipeline.step_frame(1.0));
+  CHECK(game->updates == 4);
+  CHECK(game->last_dt == Approx(1.0 / 120.0));
+  CHECK(physics->updates == 1);
+}
+
+TEST_CASE("frame_pipeline snapshots disabled and filtered stage stats", "[runtime][pipeline][stats]") {
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+
+  frame_stage_options disabled_options;
+  disabled_options.enabled = false;
+  frame_stage_options no_update;
+  no_update.receive_update = false;
+  frame_stage_options no_render;
+  no_render.receive_render = false;
+
+  auto* disabled = add_stage(pipeline, "disabled", true, tree->ensure("disabled"), disabled_options);
+  auto* no_update_stage = add_stage(pipeline, "no_update", false, tree->ensure("no_update"), no_update);
+  auto* no_render_stage = add_stage(pipeline, "no_render", true, tree->ensure("no_render"), no_render);
+
+  CHECK(pipeline.step_frame(0.05));
+
+  CHECK(disabled->updates == 0);
+  CHECK(disabled->renders == 0);
+  CHECK(disabled->frame_begins == 0);
+  CHECK(disabled->render_frame_begins == 0);
+  CHECK(disabled->render_frame_ends == 0);
+
+  CHECK(no_update_stage->updates == 0);
+  CHECK(no_update_stage->renders == 1);
+  CHECK(no_update_stage->frame_begins == 1);
+
+  CHECK(no_render_stage->updates == 3);
+  CHECK(no_render_stage->renders == 0);
+  CHECK(no_render_stage->render_frame_begins == 1);
+  CHECK(no_render_stage->render_frame_ends == 1);
+
+  const auto& stats = pipeline.stage_stats();
+  REQUIRE(stats.size() == 3);
+  CHECK(stats[0].enabled == false);
+  CHECK(stats[0].update_time == Approx(0.0));
+  CHECK(stats[0].render_time == Approx(0.0));
+  CHECK(stats[1].receive_update == false);
+  CHECK(stats[1].update_time == Approx(0.0));
+  CHECK(stats[1].fixed_steps == 0);
+  CHECK(stats[2].receive_render == false);
+  CHECK(stats[2].render_time == Approx(0.0));
+  CHECK(stats[2].fixed_steps == 3);
+}
+
+TEST_CASE("frame_pipeline run supports common synthetic rates", "[runtime][pipeline][pacing]") {
+  for (const double hz : { 30.0, 60.0, 144.0, 0.0 }) {
+    schedule_config config;
+    config.target_render_hz = hz;
+    test_pipeline pipeline{ frame_schedule(config) };
+    pipeline.next_delta = 1.0 / 60.0;
+    pipeline.quit_after_polls = 3;
+
+    pipeline.run();
+
+    CHECK(pipeline.clock_calls == 3);
+    CHECK(pipeline.polls == 3);
+    CHECK(pipeline.presents == 2);
+    CHECK(pipeline.stats().total_frames() == 2);
+  }
+}
+
+TEST_CASE("frame_pipeline compensates pacing oversleep with an injected clock", "[runtime][pipeline][pacing]") {
+  auto pacing = std::make_shared<manual_frame_clock>();
+  test_pipeline pipeline(frame_schedule{}, nullptr, pacing);
+  pipeline.manual_clock = pacing.get();
+  pipeline.oversleep = 0.005;
+  pipeline.next_delta = 0.0;
+  pipeline.quit_after_polls = 2;
+
+  pipeline.run();
+
+  REQUIRE(pipeline.waits == 2);
+  CHECK(pipeline.wait_times[0] == Approx(1.0 / 60.0));
+  CHECK(pipeline.wait_times[1] == Approx(1.0 / 60.0 - 0.005));
+  CHECK(pacing->sleeps == 0);
 }

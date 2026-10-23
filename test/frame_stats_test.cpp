@@ -155,3 +155,64 @@ TEST_CASE("frame_stats reset keeps configuration", "[runtime][stats]") {
   CHECK_FALSE(stats.is_over_budget());
   CHECK(stats.budget() == Approx(0.020));
 }
+
+TEST_CASE("frame_stats keeps a fixed rolling window", "[runtime][stats][window]") {
+  frame_stats stats(0.5, 0.01, 4);
+
+  stats.record_frame({ 0.010, 0.0, 0.0, 1 });
+  stats.record_frame({ 0.020, 0.0, 0.0, 1 });
+  stats.record_frame({ 0.030, 0.0, 0.0, 1 });
+  stats.record_frame({ 0.040, 0.0, 0.0, 1 });
+
+  CHECK(stats.window_size() == 4);
+  CHECK(stats.window_sample_count() == 4);
+  CHECK(stats.min_frame_time() == Approx(0.010));
+  CHECK(stats.max_frame_time() == Approx(0.040));
+  CHECK(stats.percentile(0.0) == Approx(0.010));
+  CHECK(stats.percentile(0.5) == Approx(0.025));
+  CHECK(stats.percentile(1.0) == Approx(0.040));
+
+  stats.record_frame({ 0.050, 0.0, 0.0, 1 });
+  CHECK(stats.window_sample_count() == 4);
+  CHECK(stats.min_frame_time() == Approx(0.020));
+  CHECK(stats.max_frame_time() == Approx(0.050));
+  CHECK(stats.percentile(0.5) == Approx(0.035));
+
+  stats.record_frame({ 0.060, 0.0, 0.0, 1 });
+  CHECK(stats.min_frame_time() == Approx(0.030));
+  CHECK(stats.max_frame_time() == Approx(0.060));
+}
+
+TEST_CASE("frame_stats window capacity and reset", "[runtime][stats][window]") {
+  frame_stats tiny(0.5, 0.01, 0);
+  CHECK(tiny.window_size() == 1);
+  tiny.record_frame({ 0.010, 0.0, 0.0, 1 });
+  tiny.record_frame({ 0.020, 0.0, 0.0, 1 });
+  CHECK(tiny.window_sample_count() == 1);
+  CHECK(tiny.min_frame_time() == Approx(0.020));
+
+  frame_stats huge(0.5, 0.01, 1000);
+  CHECK(huge.window_size() == frame_stats::max_window_size);
+
+  frame_stats stats(0.5, 0.01, 4);
+  stats.record_frame({ 0.010, 0.0, 0.0, 1 });
+  stats.record_frame({ 0.020, 0.0, 0.0, 1 });
+  CHECK(stats.window_sample_count() == 2);
+
+  stats.reset();
+  CHECK(stats.window_sample_count() == 0);
+  CHECK(stats.min_frame_time() == Approx(0.0));
+  CHECK(stats.max_frame_time() == Approx(0.0));
+  CHECK(stats.percentile(0.5) == Approx(0.0));
+  CHECK(stats.window_size() == 4);
+}
+
+TEST_CASE("frame_stats reports budget margin and clamped percentiles", "[runtime][stats][window]") {
+  frame_stats stats(0.5, 0.020, 4);
+  stats.record_frame({ 0.010, 0.0, 0.0, 1 });
+
+  CHECK(stats.budget_margin() == Approx(0.010));
+  CHECK(stats.percentile(-1.0) == Approx(0.010));
+  CHECK(stats.percentile(2.0) == Approx(0.010));
+  CHECK(stats.percentile(std::numeric_limits<double>::quiet_NaN()) == Approx(0.010));
+}

@@ -10,10 +10,34 @@
  */
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <string_view>
 
 namespace cyberverse {
 namespace runtime {
+
+/**
+ * @brief Read-only snapshot of one stage's latest frame.
+ *
+ * The name is a view into the owning pipeline's stage storage. It is valid
+ * until a stage is added, erased, or cleared.
+ */
+struct frame_stage_stats {
+  std::string_view name;
+  uint64_t stage_id = 0;
+  int group = 0;
+  bool enabled = true;
+  bool receive_update = true;
+  bool receive_render = true;
+  double update_time = 0.0;
+  double render_time = 0.0;
+  int fixed_steps = 0;
+  double alpha = 0.0;
+  double clock_delta = 0.0;
+  uint64_t tick = 0;
+};
 
 /**
  * @brief One measured frame.
@@ -63,13 +87,23 @@ public:
   /** Multiplier above which a frame interval counts as over budget. */
   static constexpr double over_budget_ratio = 1.1;
 
+  /** Maximum number of samples retained by the rolling window. */
+  static constexpr std::size_t max_window_size = 256;
+
+  /** Default rolling-window capacity (about two seconds at 60 Hz). */
+  static constexpr std::size_t default_window_size = 120;
+
   /**
    * @brief Construct an empty statistics collector.
    *
    * @param ema_alpha Smoothing factor in `(0, 1]`; invalid values fall back to 0.1.
    * @param budget Frame budget in seconds; invalid values fall back to 1/60 s.
+   * @param window_size Rolling-window capacity, clamped to
+   * `[1, max_window_size]`.
    */
-  explicit frame_stats(double ema_alpha = 0.1, double budget = 1.0 / 60.0) noexcept;
+  explicit frame_stats(double ema_alpha = 0.1,
+                       double budget = 1.0 / 60.0,
+                       std::size_t window_size = default_window_size) noexcept;
 
   /**
    * @brief Record one frame and refresh the smoothed values and flags.
@@ -131,7 +165,33 @@ public:
   /** @brief Frame budget currently used by this collector, in seconds. */
   double budget() const noexcept;
 
+  /** @brief Smallest frame interval in the rolling window (0 when empty). */
+  double min_frame_time() const noexcept;
+
+  /** @brief Largest frame interval in the rolling window (0 when empty). */
+  double max_frame_time() const noexcept;
+
+  /**
+   * @brief Percentile of the rolling window frame intervals.
+   *
+   * @param p Fraction in `[0, 1]`; values outside the range are clamped.
+   * @return Linearly interpolated percentile, or 0 when the window is empty.
+   * The query uses stack storage and performs no heap allocation.
+   */
+  double percentile(double p) const noexcept;
+
+  /** @brief Budget minus the smoothed frame interval in seconds. */
+  double budget_margin() const noexcept;
+
+  /** @brief Rolling-window capacity in samples. */
+  std::size_t window_size() const noexcept;
+
+  /** @brief Number of samples currently in the rolling window. */
+  std::size_t window_sample_count() const noexcept;
+
 private:
+  void record_window_sample(double frame_time) noexcept;
+
   double ema_alpha_;
   double budget_;
   double smoothed_frame_time_ = 0.0;
@@ -141,6 +201,10 @@ private:
   int jitter_streak_ = 0;
   int over_budget_streak_ = 0;
   bool has_sample_ = false;
+  std::size_t window_capacity_ = default_window_size;
+  std::size_t window_count_ = 0;
+  std::size_t window_next_ = 0;
+  std::array<double, max_window_size> window_{};
 };
 
 } // namespace runtime
