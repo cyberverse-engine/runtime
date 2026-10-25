@@ -28,9 +28,16 @@ The library currently provides:
   snapshots, poll/present, quit handling, statistics, and pacing.
 - `frame_stats.hpp` / `.cpp` — aggregate frame and per-stage statistics, rolling window,
   min/max/percentiles, EMA, FPS/utilization, jitter and over-budget flags.
+- `frame_budget.hpp` / `.cpp` — `frame_clock`-bound remaining-time budget with unlimited mode,
+  deadlines, remaining-time sub-budgets, and frame-aligned shares.
+- `task_queue.hpp` — render-thread lane without a mutex, a mutex-protected any-thread lane, and an
+  RAII `pop_locker` for draining that lane.
+- `this_thread.hpp` / `.cpp` — thread-local render-thread role queried by
+  `is_this_render_thread()` and set by `frame_pipeline::step_frame`.
 
-The parallel/multithreaded task framework is future work. Do not add worker pools, render threads, or
-job dependencies until the roadmap milestone is explicitly scheduled.
+The task queue and frame budget are reusable foundations. The parallel task graph, dependency
+scheduler, and worker pool remain future work; do not add worker pools or job dependencies until the
+roadmap milestone is explicitly scheduled.
 
 ## Build and test
 
@@ -69,15 +76,19 @@ The runtime is layered so each piece can be tested without a window or renderer:
    other stages, or the clock tree traversal.
 5. `frame_pipeline` is the only component that calls `tick_clock()` and owns the clock tree, pacing
    clock, schedule, stats collector, stage list/options/ids, and per-stage snapshots.
+6. `task_queue` depends only on `this_thread`; `frame_budget` requires a `frame_clock` and has no
+   wall-clock fallback. Both are leaf utilities for the future task framework.
 
 Keep the dependency direction one-way: `frame_pipeline` → `frame_schedule` / `clock_tree` /
-`frame_clock` / `frame_stage` / `frame_stats`. Do not make the lower layers depend on the pipeline, the platform
-layer, GLM, the renderer, or any engine scene type.
+`frame_clock` / `frame_stage` / `frame_stats`; `this_thread` is a leaf utility used by
+`frame_pipeline`, `task_queue`, and application code. Do not make the lower layers depend on the
+pipeline, the platform layer, GLM, the renderer, or any engine scene type.
 
 `step_frame(dt)` is the deterministic frame primitive. It executes exactly one frame and never
-sleeps. `run()` is the convenience loop that calls `tick_clock()`, advances an absolute deadline on
-the injected `frame_clock`, calls `on_throttle_wait`, and delegates to `step_frame`. Do not move
-pacing or sleeping into `step_frame`.
+sleeps. Before any frame callback it marks the calling thread with
+`set_this_as_render_thread()`. `run()` is the convenience loop that calls `tick_clock()`, advances an
+absolute deadline on the injected `frame_clock`, calls `on_throttle_wait`, and delegates to
+`step_frame`. Do not move pacing or sleeping into `step_frame`.
 
 Each stage must own its scheduler. A `fixed_step_scheduler` stores an accumulator and either a live
 schedule reference or a standalone configuration; sharing one scheduler between stages would mix
@@ -158,9 +169,12 @@ them.
 - A frame is over budget when `frame_time > budget * 1.1` for 3 consecutive frames. A frame is jitter
   when `abs(frame_time - previous_smoothed_frame_time) > 0.2 * previous_smoothed_frame_time` for 4
   consecutive frames. `set_budget` resets the over-budget streak but keeps the EMAs.
-- `frame_pipeline::step_frame` polls, updates the clock tree, runs frame/render lifecycle hooks,
-  updates and renders stages in their order lists, presents, records aggregate statistics, and
-  refreshes the statistics budget. A quit from `on_poll` skips the clock update, lifecycle hooks,
+- `frame_pipeline::step_frame` marks the calling thread via `set_this_as_render_thread()` before
+  `on_poll`, then polls, updates the clock tree, runs frame/render lifecycle hooks, updates and
+  renders stages in their order lists, presents, records aggregate statistics, and refreshes the
+  statistics budget. The flag is thread-local, starts false, is not tied to one pipeline instance,
+  and remains true for the thread's lifetime; `is_this_render_thread()` only observes the calling
+  thread. There is no unset operation. A quit from `on_poll` skips the clock update, lifecycle hooks,
   stages, and present. A quit from a frame-begin hook or stage update skips remaining updates, all
   renders, and present. A quit from the render phase stops remaining renders, still runs
   render-frame-end hooks, and still presents and records statistics. A quit from `on_present` is
@@ -172,16 +186,38 @@ them.
   synthetic waits; tests should advance a manual `frame_clock` instead of sleeping. `run()` keeps an
   absolute deadline, lets small oversleeps shorten the next wait, and resynchronizes after a stall
   longer than one frame. It checks `should_quit_requested()` once per frame before doing work.
+- `frame_budget` requires a `frame_clock`; there is no default constructor or wall-clock path. It
+  starts counting at construction. A negative or non-finite budget is unlimited: `has_remaining()`
+  stays true, `remaining_seconds()` returns `std::numeric_limits<double>::max()`, and
+  `is_unlimited()` is true. Finite remaining time is clamped to zero, `used_seconds()` is clamped to
+  zero, and `has_remaining()` is `used_seconds() < budget`. `deadline_seconds()` returns
+  `start + budget`, or positive infinity for unlimited budgets. `sub(ratio)` starts a child covering
+  `ratio` of the current remainder; `share(ratio)` uses `ratio` of the parent's total budget and
+  shares its start, so its deadline is `start + total * ratio`. Ratios are clamped to `[0, 1]`; the
+  parent is never mutated.
+- `task_queue<T>` writes to the mutex-free render lane when `is_this_render_thread()` is true and to
+  the mutex-protected any-thread lane otherwise. Pops prefer the render lane. `try_pop` locks the
+  any-thread lane for one pop. `pop_locker()` returns an RAII `pop_locker`; its `try_pop(T&)` and
+  `try_pop()` overloads drain only the any-thread lane without re-locking. Do not call the
+  queue-level `try_pop` while the locker is alive. Non-render threads only observe the any-thread
+  lane. The design assumes exactly one active render thread and a movable, move-assignable `T`.
 - `request_quit()` and `should_quit()` use an atomic flag and are safe from any thread. All other
   runtime state is single-threaded.
 
 ## Threading
 
-The current runtime is single-threaded. `frame_pipeline` must be driven from one thread; application
-hooks and stage callbacks run on that thread. `request_quit()` is the only cross-thread entry point.
-Do not add hidden background threads, global thread pools, or blocking synchronization to the frame
-path. The future job system must be introduced behind an explicit API and a roadmap milestone, with
-deterministic ordering tests.
+The frame loop is single-threaded. `frame_pipeline` must be driven from one thread; application hooks
+and stage callbacks run on that thread. `request_quit()` and `should_quit()` are safe from any thread.
+`is_this_render_thread()` is also safe from any thread because it reads thread-local state, and
+`step_frame` marks its own calling thread only.
+
+`task_queue` is the explicit exception for cross-thread work submission: its any-thread lane is
+mutex-protected, its render lane must be touched only by the single render thread, and the locker
+returned by `pop_locker()` must be drained by the thread that owns it. `frame_budget` is a value
+object and is not synchronized; all copies and sub-budgets share the caller-provided
+`frame_clock`. Do not add hidden background threads, global thread pools, or blocking synchronization
+to the frame path. The future job system must be introduced behind an explicit API and a roadmap
+milestone, with deterministic ordering tests.
 
 ## Style
 

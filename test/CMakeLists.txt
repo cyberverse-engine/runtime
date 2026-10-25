@@ -14,10 +14,13 @@ add_executable(
   cyberverse_runtime_tests
   clock_node_test.cpp
   clock_tree_test.cpp
+  frame_budget_test.cpp
   frame_pipeline_test.cpp
   frame_schedule_test.cpp
   frame_stage_test.cpp
   frame_stats_test.cpp
+  task_queue_test.cpp
+  this_thread_test.cpp
 )
 
 target_link_libraries(

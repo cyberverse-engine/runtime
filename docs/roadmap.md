@@ -42,10 +42,12 @@
 | 阶段统计 | `stage_stats()` 以注册顺序返回零分配只读快照：id、group、enabled、receive、update/render 时间、fixed steps、alpha、clock delta、tick。 |
 | 多时钟阶段 | `frame_pipeline` 每帧更新时钟树；每个 stage 绑定一个 `clock_node`，游戏时钟暂停/慢放时 UI 时钟可继续。 |
 | 帧循环 | `frame_pipeline` 负责 `tick_clock`、poll、生命周期和 present；stage 负责 update/render；按 update/render 顺序调度后 present。 |
+| 渲染线程识别 | `this_thread` 提供 thread-local 渲染线程角色；`frame_pipeline::step_frame` 在 `on_poll` 前标记调用线程，`is_this_render_thread()` 可在 stage/present 中查询。 |
+| 任务基础设施 | `task_queue<T>` 提供渲染线程无互斥锁通道和任意线程互斥通道，支持优先弹出、并发生产，以及只排空 any lane 的 RAII `pop_locker`；`frame_budget` 必须注入 `frame_clock`，提供剩余/已用时间、无限预算、绝对 deadline、剩余时间子预算和帧对齐 share。 |
 | 退出语义 | poll 退出跳过整帧；frame-begin/update 退出跳过剩余 update/render/present；render 退出停止剩余 render，仍执行 render-end、present 并记录统计。 |
 | 确定性 pacing | `frame_clock` + `steady_frame_clock`；`run()` 维护绝对 deadline，默认 sleep-until，小过睡缩短下一帧等待，大停顿后重新同步；测试可注入 manual clock。 |
 | 统计 | `frame_stats` 维护聚合 EMA、FPS、预算利用率、抖动/连续超预算；固定滚动窗口（默认 120，最大 256）提供 min/max/percentile/budget margin，查询不分配堆内存。 |
-| 验证 | 87 个 Catch2 测试覆盖时钟继承/操作/调试、阶段 id/options/groups/reentrancy、每 stage 频率、scheduler 实时继承/部分覆盖、阶段统计、生命周期、独立 scheduler、退出、pacing/过睡、自适应、统计窗口和 EMA；17 组 Google Benchmark 覆盖 scheduler、时钟树、统计、阶段查询、优先级、过滤和多阶段整帧开销。 |
+| 验证 | 102 个 Catch2 测试覆盖时钟继承/操作/调试、阶段 id/options/groups/reentrancy、每 stage 频率、scheduler 实时继承/部分覆盖、阶段统计、生命周期、独立 scheduler、渲染线程识别、任务队列双通道/并发生产/RAII pop_locker/move-only、帧预算/子预算/share/deadline、退出、pacing/过睡、自适应、统计窗口和 EMA；17 组 Google Benchmark 覆盖 scheduler、时钟树、统计、阶段查询、优先级、过滤和多阶段整帧开销。 |
 | 依赖与打包 | 仅 C++ 标准库与 `Threads::Threads`；尚未提供 install/export 包、版本头和 CI。 |
 
 ### 已知限制
@@ -62,7 +64,10 @@
   帧起始到下一帧起始的墙钟间隔。
 - 没有逐 stage 的预算告警或降载信号；`stage_stats` 只提供耗时快照，自动帧率稳定仍是全局策略。
 - 统计窗口是固定容量的原始样本窗口；没有直方图、指数衰减分位数或长期持久化。
-- 没有任务系统、工作线程、帧内依赖图或并行阶段；所有 stage 在循环线程串行执行。
+- 没有任务图、依赖调度器、工作线程或并行 stage；所有 stage 仍在循环线程串行执行。
+  `task_queue`/`frame_budget` 只是 v0.3 任务框架的基础件。
+- 渲染线程标记是线程局部且只增不减：无法区分同一线程上的多个 pipeline，也没有解除或转移接口。
+  `task_queue` 因此假设同一时间只有一个活跃渲染线程。
 - 尚未与 `platform` 的事件泵/计时器和 `render-core` 的呈现路径做示例级集成。
 - 没有安装/导出 CMake 包、版本头、示例程序、CI 矩阵或生成的 API 文档。
 
@@ -76,11 +81,21 @@ v0.2 的 P0/P1 工作已落地并通过测试：
 | 稳定 stage id、运行时启停/修改顺序、分组、帧内防重入、disabled 语义 | P0 | 完成 |
 | 每 stage 固定频率/最大步数/最大帧时间覆盖 | P0 | 完成 |
 | scheduler 默认实时继承 schedule；`fixed_step_overrides` 只固定显式覆盖项 | P0 | 完成 |
+| 渲染线程识别：thread-local 角色，`step_frame` 在回调前标记 | P1 | 完成（后续补充） |
 | 可复用 steady-clock、可注入 pacing clock、绝对 deadline、sleep-until、过睡补偿 | P0 | 完成 |
 | 时钟树 reparent/clone、路径校验、全局暂停、全树快照、文本/JSON 导出 | P1 | 完成 |
 | 时间缩放曲线/逐节点回调评估、暂停渲染语义、`total_time` 连续性 | P1 | 已评估并记录决策 |
 | 滚动窗口、最大/最小帧、分位数、逐 stage 耗时、预算余量、零分配查询 | P1 | 完成 |
 | 合成时钟测试覆盖 30/60/144/无限、暂停、缩放、追帧、退出 | P0 | 完成 |
+
+### v0.3 前置基础件
+
+完整的任务图、依赖调度和 worker 池尚未实现；以下基础件已落地并通过测试：
+
+| 项目 | 状态 |
+| --- | --- |
+| `task_queue<T>`：渲染线程无互斥锁通道 + 任意线程互斥通道、渲染优先、并发生产、RAII pop_locker 只排空 any lane | 完成 |
+| `frame_budget`：必须注入 `frame_clock`、剩余/已用时间、无限预算、deadline、剩余时间子预算、帧对齐 share | 完成 |
 
 ### 设计决策
 
@@ -104,8 +119,19 @@ v0.2 的 P0/P1 工作已落地并通过测试：
   参数时使用 `fixed_step_overrides` 的 `std::optional` 字段，只有被赋值的字段停止跟随；
   显式 `schedule_config` 构造的 scheduler 保持独立。代价是 scheduler 必须由调用方保证
   schedule 生命周期长于自身。
+- **渲染线程标记：** 使用 `thread_local` 布尔值，初始为 false；`step_frame` 在 `on_poll` 前
+  设置，只影响调用线程。标记不绑定某个 pipeline 实例，也不提供解除接口，避免同一线程上的
+  多个 pipeline 互相覆盖角色。`run()` 通过 `step_frame` 获得同样的标记。
 - **帧内修改：** `stepping_` guard 拒绝 add/erase/options/enable 修改；`clear_stages` 在帧内为
   no-op。阶段列表只在帧之间变化，避免迭代器/索引失效。
+- **任务队列通道：** 渲染线程通道完全不加锁，依赖“同一时间只有一个活跃渲染线程”的约定；
+  其他线程统一走互斥通道。`try_pop` 固定渲染通道优先，避免渲染线程自己的任务被跨线程任务
+  饿死。批量弹出使用 `pop_locker()` 返回的 RAII `pop_locker`，其 `try_pop` 只排空 any lane，
+  不会被新渲染任务插队；locker 存活期间不得调用 queue 级 `try_pop`。
+- **帧预算：** 不提供墙钟默认构造，必须注入 `frame_clock`，避免合成 `step_frame(dt)` 与真实
+  `steady_clock` 混用。`sub(ratio)` 取当前剩余时间的比例并从调用时刻重新计时；`share(ratio)`
+  取父总预算的比例并共享父起点，因此兄弟 share 的 deadline 都是 `start + total * ratio`。
+  比例为 0/负数/NaN 时得到已耗尽子预算，比例大于 1 时按 1 处理。
 
 ## 里程碑
 
@@ -119,7 +145,8 @@ v0.2 的 P0/P1 工作已落地并通过测试：
 ### v0.3 — 并行任务框架
 
 **目标：** 在不破坏固定步长、时钟语义、确定性帧协议和单线程回退的前提下，把 stage/帧内工作
-拆分为可依赖的任务图。该里程碑目前不实现，只定义边界、语义和验收方式。
+拆分为可依赖的任务图。完整任务图尚未实现；`task_queue`/`frame_budget` 基础件已落地，本节
+定义剩余边界、语义和验收方式。
 
 - **任务模型（P0）。** 引入 `task`/`job` 的值语义描述、稳定句柄、依赖边和取消状态；调用方
   提交可调用对象，运行时不解释业务类型、不内建 ECS 或场景概念。任务节点应支持预分配或
@@ -186,6 +213,20 @@ README、AGENTS 和测试。
   继续跟随；显式 `schedule_config` 构造的 scheduler 独立。继承 scheduler 要求 schedule 生命周期
   不短于 scheduler。`step` 对负值/非有限 delta 按 0 处理，超过 `max_frame_time` 钳制，超过最大
   步数丢弃整步并置 `dropped_backlog`，`alpha` 保持 `[0, 1)`。
+- `frame_pipeline::step_frame` 在 `on_poll` 前把调用线程标记为渲染线程；
+  `is_this_render_thread()` 读取 thread-local 状态，初始为 false，线程生命周期内保持 true，
+  不绑定 pipeline 实例，也没有解除接口。`run()` 通过 `step_frame` 获得相同标记。
+- `frame_budget` 必须通过 `frame_clock` 构造，不提供默认构造或墙钟路径；clock 生命周期必须
+  覆盖 budget 及所有子预算。负值/非有限预算为无限，`has_remaining()` 恒为 true，
+  `remaining_seconds()` 返回 `std::numeric_limits<double>::max()`，`is_unlimited()` 为 true，
+  `deadline_seconds()` 返回正无穷。有限剩余时间和已用时间都 clamp 到非负；`deadline_seconds()`
+  返回 `start + budget`。`sub(ratio)` 从当前剩余时间取比例并从调用时刻重新计时；
+  `share(ratio)` 取父总预算比例并共享父起点，deadline 为 `start + total * ratio`。比例为
+  0/负数/NaN 时得到已耗尽子预算，大于 1 时按 1 处理。
+- `task_queue<T>` 在渲染线程写入无互斥锁通道，其他线程写入互斥通道；`try_pop` 优先渲染通道。
+  非渲染线程只看到互斥通道。`pop_locker()` 返回 RAII `pop_locker`，其 `try_pop(T&)` 与
+  `try_pop()` 只弹 any lane；locker 必须由创建线程持有到排空结束，存活期间不得调用 queue 级
+  `try_pop`。该类型假设同一时间只有一个活跃渲染线程，且 `T` 可移动、可移动赋值。
 - `target_render_hz == 0` 表示无限模式；`target_frame_time()` 返回 0。
 - fixed stage 每帧执行零到多次 `on_update(logic_step, stage_tick)` 和一次
   `on_render(alpha, clock_delta)`；variable stage 每帧执行一次 `on_update(clock_delta,

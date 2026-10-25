@@ -15,6 +15,8 @@
 #include <cmath>
 #include <utility>
 
+#include "cyberverse/runtime/this_thread.hpp"
+
 namespace cyberverse::runtime {
 namespace {
 
@@ -113,6 +115,8 @@ bool frame_pipeline::step_frame(double frame_delta) {
     ~stepping_guard() { flag_ = false; }
     bool& flag_;
   } guard(stepping_);
+
+  set_this_as_render_thread();
 
   on_poll();
   if (should_quit()) {

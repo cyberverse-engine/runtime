@@ -46,9 +46,19 @@ application hooks. The only external dependency is the C++ standard library. The
   tick/poll → frame lifecycle → prioritized stage updates → prioritized renders → present →
   statistics. `step_frame(dt)` executes a frame deterministically; `run()` asks `tick_clock()` for
   the real delta and performs pacing.
+- **Render-thread identification** — `is_this_render_thread()` reports a thread-local render role.
+  `step_frame()` marks the calling thread before any frame callback, so stages, presenters, and render
+  helpers can assert that they run on the render thread.
+- **Task queue primitives** — `task_queue<T>` has a mutex-free render-thread lane and a locked
+  any-thread lane. It prefers render work, supports concurrent external producers, and exposes an
+  RAII `pop_locker` whose `try_pop` overloads drain only the any-thread lane without re-locking.
+- **Frame budgets** — `frame_budget` is always bound to a `frame_clock`; it reports remaining/used
+  time and an absolute deadline, treats negative budgets as unlimited, and derives both
+  remaining-time slices and frame-aligned shares.
 
-The parallel/multithreaded task framework is planned but intentionally not implemented yet. See the
-repository [roadmap](docs/roadmap.md) and the workspace [roadmap](../docs/roadmap.md).
+The parallel task graph, dependency scheduler, and worker pool are still future work; the task queue
+and budget are the reusable foundations. See the repository [roadmap](docs/roadmap.md) and the
+workspace [roadmap](../docs/roadmap.md).
 
 ## Layout
 
@@ -68,6 +78,11 @@ src/cyberverse/runtime/frame_pipeline.hpp   Stage-driven frame loop, ids, stats,
 src/cyberverse/runtime/frame_pipeline.cpp   Clock update, stage dispatch, quit, statistics
 src/cyberverse/runtime/frame_stats.hpp      Frame/stage stats, rolling window, health flags
 src/cyberverse/runtime/frame_stats.cpp      Statistics implementation
+src/cyberverse/runtime/frame_budget.hpp     Frame and sub-task time budgets
+src/cyberverse/runtime/frame_budget.cpp     Budget implementation
+src/cyberverse/runtime/task_queue.hpp       Render-thread/any-thread task queue
+src/cyberverse/runtime/this_thread.hpp      Thread-local render-thread role
+src/cyberverse/runtime/this_thread.cpp      Render-thread role implementation
 ```
 
 ## Build
@@ -96,8 +111,9 @@ lifetime, path validation, global pause, reparent/clone, snapshots/export, per-s
 independence, fixed/variable stage dispatch, priority ordering, receive flags, stage ids/options/
 groups/reentrancy, per-stage fixed frequencies, per-stage statistics, lifecycle hooks, quit paths,
 pacing deadlines and oversleep compensation, adaptive rate changes, EMA smoothing, rolling windows,
-min/max/percentiles, and jitter/over-budget detection. Tests are deterministic: no sleeps and no
-wall-clock assertions.
+min/max/percentiles, jitter/over-budget detection, frame-budget sub/share/deadline semantics,
+render-thread queue priority, RAII pop_locker draining, move-only tasks, and concurrent external
+producers. Tests are deterministic: no sleeps and no wall-clock assertions.
 
 ### Benchmark
 
@@ -308,13 +324,46 @@ render(step.alpha);
 - `on_throttle_wait(seconds)` defaults to waiting on the pacing clock with a sleep-until deadline.
   Override it to inject a synthetic wait; tests typically advance a manual `frame_clock` instead of
   sleeping.
+- `step_frame` marks the calling thread as a render thread before `on_poll`. The flag is thread-local,
+  starts false, is not tied to a specific pipeline, and stays true for the rest of the thread's
+  lifetime. `is_this_render_thread()` reads it; there is no unset operation. `run()` gets the same
+  marking through its calls to `step_frame`.
+- `frame_budget(seconds, clock)` starts counting on the supplied `frame_clock` at construction.
+  There is no default constructor: callers must choose the frame's time source, and the clock must
+  outlive the budget and its sub-budgets. `remaining_seconds()` never goes below zero,
+  `used_seconds()` never goes below zero, and `has_remaining()` is `used < budget`. A negative or
+  non-finite budget is unlimited: `has_remaining()` stays true, `remaining_seconds()` returns
+  `std::numeric_limits<double>::max()`, and `is_unlimited()` is true. `deadline_seconds()` returns
+  `start + budget`, or positive infinity when unlimited. `sub(ratio)` starts a child budget covering
+  `ratio` of the current remainder; `share(ratio)` uses `ratio` of the parent's total budget and
+  shares its start, so sibling shares remain frame-aligned. Ratios are clamped to `[0, 1]`, and the
+  parent keeps counting independently.
+- `task_queue<T>` pushes to the render-thread lane without a mutex when the caller is the render
+  thread, and to the mutex-protected any-thread lane otherwise. Pops prefer the render lane; the
+  render thread may then pop one any-thread task with `try_pop`, or hold the any-thread lock in a
+  `pop_locker` and drain without re-locking:
+  ```cpp
+  auto locker = queue.pop_locker();
+  while (const std::optional<T> task = locker.try_pop()) {
+    consume(*task);
+  }
+  // bool overload: if (locker.try_pop(task)) { ... }
+  ```
+  The locker holds the mutex until it is destroyed. Its `try_pop` overloads only touch the
+  any-thread lane, so the locked lane cannot be starved by new render work. Do not call the queue-level
+  `try_pop` while the locker is alive. Non-render threads only observe the any-thread lane. The queue
+  assumes exactly one active render thread and a movable, move-assignable `T`.
 
 ## Thread safety
 
 `frame_pipeline::request_quit()` and `should_quit()` are safe to call from any thread; the quit flag
 is atomic. Every other operation — including the application hooks, clock tree, pacing clock, stages,
-`step_frame`, `run`, the schedule, and the statistics collector — must run on the loop thread. The
-runtime does not start a render thread or a worker pool.
+`step_frame`, `run`, the schedule, and the statistics collector — must run on the loop thread.
+`is_this_render_thread()` is safe to call from any thread because each thread sees only its own
+thread-local flag. `task_queue` is the only component that accepts concurrent pushes: its render lane
+is single-threaded, its any-thread lane is mutex-protected, and a pop_locker must be drained by the thread
+that owns it. `frame_budget` is a value object and is not synchronized; its `frame_clock` is shared.
+The runtime does not start a render thread or a worker pool.
 
 See [AGENTS.md](AGENTS.md) for architecture and contribution rules. The detailed roadmap is in
 [docs/roadmap.md](docs/roadmap.md); the workspace roadmap is in [../docs/roadmap.md](../docs/roadmap.md).
