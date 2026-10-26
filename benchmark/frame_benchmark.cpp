@@ -6,6 +6,7 @@
 #include "cyberverse/runtime.hpp"
 
 using cyberverse::runtime::clock_tree;
+using cyberverse::runtime::frame_budget;
 using cyberverse::runtime::frame_pipeline;
 using cyberverse::runtime::frame_sample;
 using cyberverse::runtime::frame_schedule;
@@ -20,8 +21,8 @@ class null_stage final : public frame_stage {
 public:
   explicit null_stage(bool use_fixed_step) : frame_stage(use_fixed_step) {}
 
-  void on_update(double, uint64_t) override {}
-  void on_render(double, double) override {}
+  void on_update(double, uint64_t, const frame_budget&) override {}
+  void on_render(double, double, const frame_budget&) override {}
 };
 
 class null_pipeline final : public frame_pipeline {

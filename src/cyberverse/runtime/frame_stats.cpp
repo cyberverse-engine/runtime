@@ -30,6 +30,7 @@ frame_stats::frame_stats(double ema_alpha, double budget, std::size_t window_siz
 
 void frame_stats::record_frame(const frame_sample& sample) noexcept {
   const double frame_time = sanitize_time(sample.frame_time);
+  const double prelude_time = sanitize_time(sample.prelude_time);
   const double logic_time = sanitize_time(sample.logic_time);
   const double render_time = sanitize_time(sample.render_time);
 
@@ -38,6 +39,7 @@ void frame_stats::record_frame(const frame_sample& sample) noexcept {
 
   if (!has_sample_) {
     smoothed_frame_time_ = frame_time;
+    smoothed_prelude_time_ = prelude_time;
     smoothed_logic_time_ = logic_time;
     smoothed_render_time_ = render_time;
     has_sample_ = true;
@@ -54,6 +56,7 @@ void frame_stats::record_frame(const frame_sample& sample) noexcept {
 
   const double keep = 1.0 - ema_alpha_;
   smoothed_frame_time_ = ema_alpha_ * frame_time + keep * smoothed_frame_time_;
+  smoothed_prelude_time_ = ema_alpha_ * prelude_time + keep * smoothed_prelude_time_;
   smoothed_logic_time_ = ema_alpha_ * logic_time + keep * smoothed_logic_time_;
   smoothed_render_time_ = ema_alpha_ * render_time + keep * smoothed_render_time_;
 
@@ -72,6 +75,7 @@ void frame_stats::record_window_sample(double frame_time) noexcept {
 
 void frame_stats::reset() noexcept {
   smoothed_frame_time_ = 0.0;
+  smoothed_prelude_time_ = 0.0;
   smoothed_logic_time_ = 0.0;
   smoothed_render_time_ = 0.0;
   total_frames_ = 0;
@@ -84,12 +88,18 @@ void frame_stats::reset() noexcept {
 
 double frame_stats::smoothed_frame_time() const noexcept { return smoothed_frame_time_; }
 
+double frame_stats::smoothed_prelude_time() const noexcept { return smoothed_prelude_time_; }
+
 double frame_stats::smoothed_logic_time() const noexcept { return smoothed_logic_time_; }
 
 double frame_stats::smoothed_render_time() const noexcept { return smoothed_render_time_; }
 
 double frame_stats::average_fps() const noexcept {
   return smoothed_frame_time_ > 0.0 ? 1.0 / smoothed_frame_time_ : 0.0;
+}
+
+double frame_stats::prelude_utilization() const noexcept {
+  return budget_ > 0.0 ? smoothed_prelude_time_ / budget_ : 0.0;
 }
 
 double frame_stats::logic_utilization() const noexcept { return budget_ > 0.0 ? smoothed_logic_time_ / budget_ : 0.0; }

@@ -9,6 +9,7 @@
 #include "cyberverse/runtime/frame_stage.hpp"
 #include "cyberverse/runtime/this_thread.hpp"
 
+using cyberverse::runtime::frame_budget;
 using cyberverse::runtime::frame_pipeline;
 using cyberverse::runtime::frame_schedule;
 using cyberverse::runtime::frame_stage;
@@ -32,9 +33,9 @@ class probe_stage final : public frame_stage {
 public:
   probe_stage() : frame_stage(true) {}
 
-  void on_update(double, uint64_t) override { update_saw_render_thread = is_this_render_thread(); }
+  void on_update(double, uint64_t, const frame_budget&) override { update_saw_render_thread = is_this_render_thread(); }
 
-  void on_render(double, double) override { render_saw_render_thread = is_this_render_thread(); }
+  void on_render(double, double, const frame_budget&) override { render_saw_render_thread = is_this_render_thread(); }
 
   bool update_saw_render_thread = false;
   bool render_saw_render_thread = false;

@@ -75,6 +75,7 @@ void frame_pipeline::run() {
     }
 
     const double frame_time = tick_clock();
+    frame_budget budget = frame_budget::unlimited();
 
     if (schedule_.is_unlimited()) {
       has_deadline = false;
@@ -97,15 +98,39 @@ void frame_pipeline::run() {
       if (after - next_deadline > target) {
         next_deadline = after;
       }
+
+      // Work is allowed until the following deadline. Starting a fresh target
+      // here would hide small oversleeps from the budget.
+      const double remaining = std::clamp(next_deadline + target - after, 0.0, target);
+      budget = frame_budget(remaining, *pacing_clock_);
     }
 
-    if (!step_frame(frame_time)) {
+    if (!step_frame(frame_time, budget)) {
       break;
     }
   }
 }
 
-bool frame_pipeline::step_frame(double frame_delta) {
+bool frame_pipeline::run_preludes(double frame_delta, const frame_budget& budget) {
+  for (frame_prelude_stats& stats : prelude_stats_) {
+    stats.time = 0.0;
+  }
+
+  for (const std::size_t index : prelude_order_) {
+    const clock_type::time_point prelude_start = clock_type::now();
+    preludes_[index].prelude->on_frame_start(frame_delta, budget);
+    prelude_stats_[index].time = seconds_between(prelude_start, clock_type::now());
+
+    if (should_quit()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool frame_pipeline::step_frame(double frame_delta) { return step_frame(frame_delta, frame_budget::unlimited()); }
+
+bool frame_pipeline::step_frame(double frame_delta, frame_budget budget) {
   if (should_quit() || stepping_) {
     return false;
   }
@@ -124,6 +149,13 @@ bool frame_pipeline::step_frame(double frame_delta) {
   }
 
   clock_tree_->update(frame_delta);
+
+  const bool has_preludes = !preludes_.empty();
+  const clock_type::time_point prelude_start = clock_type::now();
+  if (!run_preludes(frame_delta, budget)) {
+    return false;
+  }
+  const double prelude_time = has_preludes ? seconds_between(prelude_start, clock_type::now()) : 0.0;
 
   on_frame_begin(frame_delta);
   if (should_quit()) {
@@ -179,7 +211,7 @@ bool frame_pipeline::step_frame(double frame_delta) {
       stage.fixed_steps = result.logic_steps;
 
       for (int i = 0; i < result.logic_steps; ++i) {
-        entry.stage->on_update(logic_step, entry.tick++);
+        entry.stage->on_update(logic_step, entry.tick++, budget);
         ++tick_;
 
         if (should_quit()) {
@@ -187,7 +219,7 @@ bool frame_pipeline::step_frame(double frame_delta) {
         }
       }
     } else {
-      entry.stage->on_update(stage_delta, entry.tick++);
+      entry.stage->on_update(stage_delta, entry.tick++, budget);
       ++tick_;
       entry.last_alpha = 1.0;
     }
@@ -230,7 +262,7 @@ bool frame_pipeline::step_frame(double frame_delta) {
 
       const clock_type::time_point stage_start = clock_type::now();
       const double stage_delta = entry.clock ? entry.clock->delta() : 0.0;
-      entry.stage->on_render(entry.last_alpha, stage_delta);
+      entry.stage->on_render(stage_delta, entry.last_alpha, budget);
       stage_stats_[index].render_time = seconds_between(stage_start, clock_type::now());
 
       if (should_quit()) {
@@ -249,7 +281,7 @@ bool frame_pipeline::step_frame(double frame_delta) {
   on_present();
   const double render_time = seconds_between(render_start, clock_type::now());
 
-  stats_.record_frame({ frame_delta, logic_time, render_time, fixed_steps });
+  stats_.record_frame({ frame_delta, logic_time, render_time, fixed_steps, prelude_time });
   schedule_.observe(stats_);
   refresh_budget();
 
@@ -286,6 +318,8 @@ frame_clock& frame_pipeline::pacing_clock() noexcept { return *pacing_clock_; }
 
 const frame_clock& frame_pipeline::pacing_clock() const noexcept { return *pacing_clock_; }
 
+const std::vector<frame_prelude_stats>& frame_pipeline::prelude_stats() const noexcept { return prelude_stats_; }
+
 const std::vector<frame_stage_stats>& frame_pipeline::stage_stats() const noexcept { return stage_stats_; }
 
 uint64_t frame_pipeline::tick_count() const noexcept { return tick_; }
@@ -306,6 +340,59 @@ frame_pipeline::stage_options(std::string_view name) const noexcept {
     return std::unexpected(std::make_error_code(std::errc::no_such_file_or_directory));
   }
   return it->options;
+}
+
+std::expected<void, std::error_code>
+frame_pipeline::add_prelude(std::string_view name, std::unique_ptr<frame_prelude> prelude, int order) {
+  if (stepping_) {
+    return std::unexpected(std::make_error_code(std::errc::operation_in_progress));
+  }
+  if (name.empty() || !prelude) {
+    return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+  }
+  if (has_prelude(name)) {
+    return std::unexpected(std::make_error_code(std::errc::file_exists));
+  }
+
+  preludes_.emplace_back(std::string(name), std::move(prelude), order);
+  rebuild_prelude_order();
+  rebuild_prelude_stats();
+  return {};
+}
+
+std::expected<void, std::error_code> frame_pipeline::erase_prelude(std::string_view name) {
+  if (stepping_) {
+    return std::unexpected(std::make_error_code(std::errc::operation_in_progress));
+  }
+
+  const auto it = std::find_if(preludes_.begin(), preludes_.end(), [name](const prelude_entry& entry) {
+    return entry.name == name;
+  });
+  if (it == preludes_.end()) {
+    return std::unexpected(std::make_error_code(std::errc::no_such_file_or_directory));
+  }
+
+  preludes_.erase(it);
+  rebuild_prelude_order();
+  rebuild_prelude_stats();
+  return {};
+}
+
+void frame_pipeline::clear_preludes() noexcept {
+  if (stepping_) {
+    return;
+  }
+  preludes_.clear();
+  prelude_order_.clear();
+  prelude_stats_.clear();
+}
+
+std::size_t frame_pipeline::prelude_count() const noexcept { return preludes_.size(); }
+
+bool frame_pipeline::has_prelude(std::string_view name) const noexcept {
+  return std::any_of(preludes_.begin(), preludes_.end(), [name](const prelude_entry& entry) {
+    return entry.name == name;
+  });
 }
 
 std::expected<void, std::error_code> frame_pipeline::add_stage(std::string_view name,
@@ -437,6 +524,34 @@ bool frame_pipeline::has_stage(std::string_view name) const noexcept {
   return std::any_of(stages_.begin(), stages_.end(), [name](const stage_entry& entry) {
     return entry.name == name;
   });
+}
+
+void frame_pipeline::rebuild_prelude_order() {
+  prelude_order_.resize(preludes_.size());
+  for (std::size_t i = 0; i < preludes_.size(); ++i) {
+    prelude_order_[i] = i;
+  }
+
+  std::sort(prelude_order_.begin(), prelude_order_.end(), [this](std::size_t lhs, std::size_t rhs) {
+    if (preludes_[lhs].order != preludes_[rhs].order) {
+      return preludes_[lhs].order < preludes_[rhs].order;
+    }
+    return lhs < rhs;
+  });
+}
+
+void frame_pipeline::rebuild_prelude_stats() {
+  // Do not read the previous snapshots here: their names view preludes_ strings
+  // that may have moved during insertion/erase. Timing starts fresh after a
+  // registration change.
+  std::vector<frame_prelude_stats> next(preludes_.size());
+
+  for (std::size_t i = 0; i < preludes_.size(); ++i) {
+    next[i].name = preludes_[i].name;
+    next[i].order = preludes_[i].order;
+  }
+
+  prelude_stats_ = std::move(next);
 }
 
 void frame_pipeline::rebuild_order_lists() {

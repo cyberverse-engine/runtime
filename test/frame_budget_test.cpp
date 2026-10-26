@@ -80,6 +80,26 @@ TEST_CASE("frame_budget supports unlimited budgets", "[runtime][budget]") {
   CHECK(non_finite.remaining_seconds() == std::numeric_limits<double>::max());
 }
 
+TEST_CASE("frame_budget supports unlimited budgets without a clock", "[runtime][budget]") {
+  const frame_budget budget = frame_budget::unlimited();
+
+  CHECK(budget.is_unlimited());
+  CHECK(budget.has_remaining());
+  CHECK(budget.remaining_seconds() == std::numeric_limits<double>::max());
+  CHECK(budget.used_seconds() == Approx(0.0));
+  CHECK(budget.deadline_seconds() == std::numeric_limits<double>::infinity());
+
+  const frame_budget child = budget.sub(0.25);
+  CHECK(child.is_unlimited());
+  CHECK(child.has_remaining());
+  CHECK(child.used_seconds() == Approx(0.0));
+
+  const frame_budget shared = budget.share(0.25);
+  CHECK(shared.is_unlimited());
+  CHECK(shared.has_remaining());
+  CHECK(shared.used_seconds() == Approx(0.0));
+}
+
 TEST_CASE("frame_budget sub-budgets cover part of the remainder", "[runtime][budget]") {
   manual_clock clock;
   frame_budget budget(1.0, clock);

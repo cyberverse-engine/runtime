@@ -15,6 +15,7 @@
 namespace cyberverse {
 namespace runtime {
 
+class frame_budget;
 struct frame_stage_options;
 
 /**
@@ -48,10 +49,10 @@ public:
   /**
    * @brief Return whether this stage uses a fixed-step scheduler.
    *
-   * Fixed-step stages receive `on_update(logic_step, tick)` zero or more times
-   * per frame and `on_render(alpha, clock_delta)` once. Variable-step stages
-   * receive exactly one `on_update(clock_delta, tick)` and
-   * `on_render(1.0, clock_delta)` per frame.
+   * Fixed-step stages receive `on_update(logic_step, tick, budget)` zero or more
+   * times per frame and `on_render(clock_delta, alpha, budget)` once.
+   * Variable-step stages receive exactly one `on_update(clock_delta, tick,
+   * budget)` and `on_render(clock_delta, 1.0, budget)` per frame.
    */
   bool use_fixed_step() const noexcept;
 
@@ -91,17 +92,22 @@ public:
    * step for fixed-step stages.
    * @param tick Stage-local update counter, starting at zero and incremented
    * after every call.
+   * @param budget Frame budget shared by all stages for this frame. It is valid
+   * only during the callback; copy it before storing. The budget is advisory:
+   * the pipeline still executes every fixed step returned by the scheduler.
    */
-  virtual void on_update(double dt, uint64_t tick) = 0;
+  virtual void on_update(double dt, uint64_t tick, const frame_budget& budget) = 0;
 
   /**
    * @brief Render the stage.
    *
+   * @param dt Stage clock delta for this frame.
    * @param alpha Interpolation fraction in `[0, 1)` for fixed-step stages;
    * always 1.0 for variable-step stages.
-   * @param dt Stage clock delta for this frame.
+   * @param budget Frame budget shared by all stages for this frame. It is valid
+   * only during the callback; copy it before storing.
    */
-  virtual void on_render(double alpha, double dt) = 0;
+  virtual void on_render(double dt, double alpha, const frame_budget& budget) = 0;
 
 protected:
   /** @brief Construct a stage and choose its update model. */

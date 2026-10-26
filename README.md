@@ -23,8 +23,13 @@ application hooks. The only external dependency is the C++ standard library. The
   per-stage fixed-step overrides are also available.
 - **Per-stage statistics** — the pipeline exposes a zero-allocation `stage_stats()` view with each
   stage's id, group, update/render time, fixed steps, alpha, clock delta, and tick.
+- **Per-prelude statistics** — `prelude_stats()` exposes each prelude's name, order, and latest
+  execution time in registration order, without allocating on query.
 - **Frame lifecycle hooks** — the pipeline and each stage expose frame-begin, render-frame-begin and
   render-frame-end hooks around the update/render phases.
+- **Frame preludes** — `frame_prelude` services run once at frame start, after poll and clock update
+  but before game update/render. Each receives the frame delta and the shared frame budget; multiple
+  libraries can register ordered preludes for resource upload/GPU checks and similar work.
 - **Per-stage fixed-step schedulers** — `frame_schedule::fixed_step_scheduler` owns an independent
   accumulator and inherits the schedule's logic configuration live. Every fixed-step stage gets its
   own scheduler, so different clock speeds or logic frequencies do not share catch-up state.
@@ -39,9 +44,9 @@ application hooks. The only external dependency is the C++ standard library. The
 - **Automatic frame-rate stabilization** — when enabled, `frame_schedule` lowers the active render
   rate after consistently missed frames and recovers towards the configured rate when there is CPU
   headroom. The target never drops below `min_render_hz` or rises above the configured rate.
-- **Frame statistics** — `frame_stats` maintains EMAs for frame, logic, and render time, derives FPS
-  and budget utilization, exposes jitter and over-budget flags, and keeps a fixed-size rolling
-  window with min/max/percentile and budget-margin queries.
+- **Frame statistics** — `frame_stats` maintains EMAs for frame, prelude, logic, and render time,
+  derives FPS and per-phase budget utilization, exposes jitter and over-budget flags, and keeps a
+  fixed-size rolling window with min/max/percentile and budget-margin queries.
 - **Frame loop** — `frame_pipeline` owns the clock tree and stages and implements
   tick/poll → frame lifecycle → prioritized stage updates → prioritized renders → present →
   statistics. `step_frame(dt)` executes a frame deterministically; `run()` asks `tick_clock()` for
@@ -54,7 +59,8 @@ application hooks. The only external dependency is the C++ standard library. The
   RAII `pop_locker` whose `try_pop` overloads drain only the any-thread lane without re-locking.
 - **Frame budgets** — `frame_budget` is always bound to a `frame_clock`; it reports remaining/used
   time and an absolute deadline, treats negative budgets as unlimited, and derives both
-  remaining-time slices and frame-aligned shares.
+  remaining-time slices and frame-aligned shares. Stage `on_update`/`on_render` receive the current
+  frame's budget; lifecycle hooks do not.
 
 The parallel task graph, dependency scheduler, and worker pool are still future work; the task queue
 and budget are the reusable foundations. See the repository [roadmap](docs/roadmap.md) and the
@@ -74,8 +80,9 @@ src/cyberverse/runtime/frame_schedule.hpp   Pacing policy and per-stage schedule
 src/cyberverse/runtime/frame_schedule.cpp   Pacing, adaptive rate, fixed-step accumulator
 src/cyberverse/runtime/frame_stage.hpp      Fixed-step or variable-step stage interface
 src/cyberverse/runtime/frame_stage.cpp      Stage base implementation
-src/cyberverse/runtime/frame_pipeline.hpp   Stage-driven frame loop, ids, stats, pacing
-src/cyberverse/runtime/frame_pipeline.cpp   Clock update, stage dispatch, quit, statistics
+src/cyberverse/runtime/frame_pipeline.hpp   Stage-driven frame loop, ids, prelude/stage stats, pacing
+src/cyberverse/runtime/frame_pipeline.cpp   Clock update, preludes, stage dispatch, quit, statistics
+src/cyberverse/runtime/frame_prelude.hpp    Budgeted frame-start service interface
 src/cyberverse/runtime/frame_stats.hpp      Frame/stage stats, rolling window, health flags
 src/cyberverse/runtime/frame_stats.cpp      Statistics implementation
 src/cyberverse/runtime/frame_budget.hpp     Frame and sub-task time budgets
@@ -111,9 +118,11 @@ lifetime, path validation, global pause, reparent/clone, snapshots/export, per-s
 independence, fixed/variable stage dispatch, priority ordering, receive flags, stage ids/options/
 groups/reentrancy, per-stage fixed frequencies, per-stage statistics, lifecycle hooks, quit paths,
 pacing deadlines and oversleep compensation, adaptive rate changes, EMA smoothing, rolling windows,
-min/max/percentiles, jitter/over-budget detection, frame-budget sub/share/deadline semantics,
-render-thread queue priority, RAII pop_locker draining, move-only tasks, and concurrent external
-producers. Tests are deterministic: no sleeps and no wall-clock assertions.
+min/max/percentiles, jitter/over-budget detection, frame-budget sub/share/deadline semantics and
+callback injection, frame preludes (order, budget, timing, quit, mutation, exceptions), per-prelude
+timing, render-thread queue
+priority, RAII pop_locker draining, move-only tasks, and concurrent external producers. Tests are
+deterministic: no sleeps and no wall-clock assertions.
 
 ### Benchmark
 
@@ -146,14 +155,16 @@ class game_stage final : public frame_stage {
 public:
   game_stage() : frame_stage(true) {} // fixed-step updates
 
-  void on_update(double dt, uint64_t tick) override {
-    (void)dt;   // Always the fixed logic step.
-    (void)tick; // Stage-local tick, starting at 0.
+  void on_update(double dt, uint64_t tick, const frame_budget& budget) override {
+    (void)dt;     // Always the fixed logic step.
+    (void)tick;   // Stage-local tick, starting at 0.
+    (void)budget; // Optional: stop optional work when the frame budget is exhausted.
   }
 
-  void on_render(double alpha, double dt) override {
-    (void)alpha; // Interpolate between the previous and next logic state.
-    (void)dt;    // Effective game-clock delta for this frame.
+  void on_render(double dt, double alpha, const frame_budget& budget) override {
+    (void)dt;     // Effective game-clock delta for this frame.
+    (void)alpha;  // Interpolate between the previous and next logic state.
+    (void)budget; // Optional: skip optional passes when out of time.
   }
 };
 
@@ -161,14 +172,16 @@ class ui_stage final : public frame_stage {
 public:
   ui_stage() : frame_stage(false) {} // variable-step updates
 
-  void on_update(double dt, uint64_t tick) override {
-    (void)dt;   // Effective UI-clock delta; can keep running while the game is paused.
-    (void)tick; // Stage-local update counter.
+  void on_update(double dt, uint64_t tick, const frame_budget& budget) override {
+    (void)dt;     // Effective UI-clock delta; can keep running while the game is paused.
+    (void)tick;   // Stage-local update counter.
+    (void)budget;
   }
 
-  void on_render(double alpha, double dt) override {
-    (void)alpha; // Always 1.0 for variable-step stages.
+  void on_render(double dt, double alpha, const frame_budget& budget) override {
     (void)dt;
+    (void)alpha; // Always 1.0 for variable-step stages.
+    (void)budget;
   }
 };
 
@@ -277,12 +290,37 @@ render(step.alpha);
   schedulers created from it. `step()` treats negative/non-finite deltas as zero, clamps to
   `max_frame_time`, and drops excess whole steps when more than `max_logic_steps_per_frame` are
   pending.
-- Fixed-step stages receive zero or more `on_update(logic_step, stage_tick)` calls and exactly one
-  `on_render(alpha, clock_delta)` call per frame. `alpha` is the scheduler's interpolation fraction in
-  `[0, 1)`.
-- Variable-step stages receive exactly one `on_update(clock_delta, stage_tick)` and one
-  `on_render(1.0, clock_delta)` call per frame. They do not allocate or consume a fixed-step
+- Fixed-step stages receive zero or more `on_update(logic_step, stage_tick, budget)` calls and
+  exactly one `on_render(clock_delta, alpha, budget)` call per frame. `alpha` is the scheduler's
+  interpolation fraction in `[0, 1)`. The pipeline still executes every fixed step the scheduler
+  returns even when the budget is exhausted.
+- Variable-step stages receive exactly one `on_update(clock_delta, stage_tick, budget)` and one
+  `on_render(clock_delta, 1.0, budget)` call per frame. They do not allocate or consume a fixed-step
   accumulator.
+- Only `on_update`, `on_render`, and frame preludes receive a budget. Lifecycle hooks, `on_poll`, and
+  `on_present` remain budget-free; the budget is advisory and never causes the pipeline to skip
+  preludes, fixed logic, or present. Stage callbacks and preludes may call
+  `budget.sub`/`budget.share`; the budget reference is valid only during the callback.
+- Register preludes with `add_prelude(name, std::move(prelude), order)`. Lower orders run first; ties
+  keep registration order. `erase_prelude`, `clear_preludes`, `prelude_count`, and `has_prelude` are
+  frame-boundary operations; add/erase during a frame return
+  `std::errc::operation_in_progress` and `clear_preludes` is a no-op. A prelude that requests quit
+  skips the rest of the frame; exceptions propagate out of `step_frame` and no statistics are
+  recorded for that frame.
+  ```cpp
+  class upload_prelude final : public frame_prelude {
+  public:
+    void on_frame_start(double dt, const frame_budget& budget) override {
+      (void)dt;
+      if (!budget.has_remaining()) {
+        return; // Leave optional uploads for the next frame.
+      }
+      // Detect completed uploads and issue GPU work here.
+    }
+  };
+
+  pipeline.add_prelude("uploads", std::make_unique<upload_prelude>(), 0);
+  ```
 - `frame_stage_options` controls dispatch. Update phases run in ascending `update_order`; render
   phases run in ascending `render_order`. Equal priorities keep registration order. `receive_update`
   skips the stage's `on_update` and its fixed-step accumulator; `receive_render` skips only
@@ -293,14 +331,18 @@ render(step.alpha);
 - The pipeline assigns each stage a stable id (never reused) and exposes `set_stage_options`,
   `set_stage_enabled`, `set_group_enabled`, and `stage_options`. Stage mutations are rejected with
   `std::errc::operation_in_progress` from inside a frame.
-- Frame order is: poll → clock-tree update → pipeline `on_frame_begin` → stage `on_frame_begin`
-  (update order) → stage updates (update order) → pipeline `on_render_frame_begin` → stage
-  `on_render_frame_begin` (render order) → stage renders (render order) → stage
-  `on_render_frame_end` (render order) → pipeline `on_render_frame_end` → present → statistics.
+- Frame order is: poll → clock-tree update → frame preludes (order) → pipeline `on_frame_begin` →
+  stage `on_frame_begin` (update order) → stage updates (update order) → pipeline
+  `on_render_frame_begin` → stage `on_render_frame_begin` (render order) → stage renders (render
+  order) → stage `on_render_frame_end` (render order) → pipeline `on_render_frame_end` → present →
+  statistics.
   Lifecycle hooks run for every enabled stage, including stages whose receive flag is false.
 - Stage tick counters are stage-local; `frame_pipeline::tick_count()` is the total number of stage
   update calls that actually executed. `stage_stats()` is a zero-allocation, registration-ordered
   view of each stage's id, group, update/render time, fixed steps, alpha, clock delta, and tick.
+  `prelude_stats()` is the same kind of view for preludes: name, order, and latest execution time.
+  Prelude name views are invalidated by prelude add/erase/clear, and registration changes reset the
+  recorded prelude times.
 - `target_render_hz == 0` (or a negative/NaN value assigned through the setter) means unlimited:
   `target_frame_time()` is zero and `should_throttle()` always returns false.
 - Automatic stabilization is evaluated every `auto_adjust_interval` frames through
@@ -310,12 +352,15 @@ render(step.alpha);
 - `frame_stats` initializes its EMAs from the first sample and does not raise jitter or over-budget
   flags for that first frame. It keeps a fixed rolling window with `min_frame_time`,
   `max_frame_time`, `percentile`, and `budget_margin`; queries use stack storage and do no heap
-  allocation. The pipeline records aggregate logic/render time and total fixed steps.
+  allocation. The pipeline records aggregate prelude/logic/render time and total fixed steps;
+  `smoothed_prelude_time()` and `prelude_utilization()` expose the prelude portion.
 - `frame_pipeline::run()` calls `tick_clock()` once per iteration for the frame delta and uses the
   injected `frame_clock` only for wait deadlines. `steady_frame_clock` is the default; `run()` keeps
   an absolute deadline, calls `on_throttle_wait`, and lets small oversleeps shorten the next wait.
   A stall longer than one frame resynchronizes the deadline. `step_frame(dt)` never uses the pacing
-  clock, never sleeps, and never throttles.
+  clock, never sleeps, and never throttles; it passes `frame_budget::unlimited()` to preludes and
+  update/render. `step_frame(dt, budget)` accepts an explicit budget for deterministic tests or custom
+  loops.
 - A quit requested during `on_poll` skips the clock update, lifecycle hooks, stages, and present. A
   quit during a frame-begin hook or stage update skips the remaining updates, all rendering, and
   present for that frame. A quit during the render phase stops the remaining renders, still runs the
@@ -329,15 +374,18 @@ render(step.alpha);
   lifetime. `is_this_render_thread()` reads it; there is no unset operation. `run()` gets the same
   marking through its calls to `step_frame`.
 - `frame_budget(seconds, clock)` starts counting on the supplied `frame_clock` at construction.
-  There is no default constructor: callers must choose the frame's time source, and the clock must
-  outlive the budget and its sub-budgets. `remaining_seconds()` never goes below zero,
+  There is no public default constructor: callers must choose the frame's time source, and the clock
+  must outlive the budget and its sub-budgets. `frame_budget::unlimited()` creates an explicit
+  clock-free unlimited budget; its used time is zero, its deadline is positive infinity, and
+  `sub()`/`share()` stay clock-free and unlimited. `remaining_seconds()` never goes below zero,
   `used_seconds()` never goes below zero, and `has_remaining()` is `used < budget`. A negative or
   non-finite budget is unlimited: `has_remaining()` stays true, `remaining_seconds()` returns
   `std::numeric_limits<double>::max()`, and `is_unlimited()` is true. `deadline_seconds()` returns
   `start + budget`, or positive infinity when unlimited. `sub(ratio)` starts a child budget covering
   `ratio` of the current remainder; `share(ratio)` uses `ratio` of the parent's total budget and
   shares its start, so sibling shares remain frame-aligned. Ratios are clamped to `[0, 1]`, and the
-  parent keeps counting independently.
+  parent keeps counting independently. `run()` creates a finite budget from the current target frame
+  time and pacing clock after the throttle wait; an unlimited schedule uses `frame_budget::unlimited()`.
 - `task_queue<T>` pushes to the render-thread lane without a mutex when the caller is the render
   thread, and to the mutex-protected any-thread lane otherwise. Pops prefer the render lane; the
   render thread may then pop one any-thread task with `try_pop`, or hold the any-thread lock in a

@@ -40,6 +40,18 @@ struct frame_stage_stats {
 };
 
 /**
+ * @brief Read-only snapshot of one frame prelude's latest execution.
+ *
+ * The name is a view into the owning pipeline's prelude storage. It is valid
+ * until a prelude is added, erased, or cleared.
+ */
+struct frame_prelude_stats {
+  std::string_view name;
+  int order = 0;
+  double time = 0.0;
+};
+
+/**
  * @brief One measured frame.
  *
  * All times are in seconds. Invalid (negative or non-finite) values are
@@ -57,15 +69,18 @@ struct frame_sample {
 
   /** Number of fixed logic steps executed in this frame. */
   int logic_steps = 0;
+
+  /** Time spent executing frame preludes in this frame. */
+  double prelude_time = 0.0;
 };
 
 /**
  * @brief Exponentially smoothed frame timing and health flags.
  *
- * Every recorded sample updates three independent EMAs: frame interval, logic
- * time, and render time. The first sample initializes the EMAs directly; it
- * does not raise the jitter or over-budget flags because startup work is not a
- * representative steady-state frame.
+ * Every recorded sample updates four independent EMAs: frame interval, prelude
+ * time, logic time, and render time. The first sample initializes the EMAs
+ * directly; it does not raise the jitter or over-budget flags because startup
+ * work is not a representative steady-state frame.
  *
  * Budget semantics: @ref budget is the frame interval the runtime is trying
  * to hit (usually `1 / target_render_hz`). A frame is "over budget" when its
@@ -122,6 +137,9 @@ public:
   /** @brief Smoothed wall-clock frame interval in seconds (0 before the first sample). */
   double smoothed_frame_time() const noexcept;
 
+  /** @brief Smoothed prelude time in seconds (0 before the first sample). */
+  double smoothed_prelude_time() const noexcept;
+
   /** @brief Smoothed logic time in seconds (0 before the first sample). */
   double smoothed_logic_time() const noexcept;
 
@@ -134,6 +152,9 @@ public:
    * Returns 0 before the first sample or when the smoothed interval is zero.
    */
   double average_fps() const noexcept;
+
+  /** @brief Smoothed prelude time divided by the frame budget. */
+  double prelude_utilization() const noexcept;
 
   /** @brief Smoothed logic time divided by the frame budget. */
   double logic_utilization() const noexcept;
@@ -195,6 +216,7 @@ private:
   double ema_alpha_;
   double budget_;
   double smoothed_frame_time_ = 0.0;
+  double smoothed_prelude_time_ = 0.0;
   double smoothed_logic_time_ = 0.0;
   double smoothed_render_time_ = 0.0;
   uint64_t total_frames_ = 0;

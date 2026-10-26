@@ -23,7 +23,9 @@
 
 #include "cyberverse/runtime/clock_node.hpp"
 #include "cyberverse/runtime/clock_tree.hpp"
+#include "cyberverse/runtime/frame_budget.hpp"
 #include "cyberverse/runtime/frame_clock.hpp"
+#include "cyberverse/runtime/frame_prelude.hpp"
 #include "cyberverse/runtime/frame_schedule.hpp"
 #include "cyberverse/runtime/frame_stage.hpp"
 #include "cyberverse/runtime/frame_stats.hpp"
@@ -78,34 +80,37 @@ struct frame_stage_options {
 };
 
 /**
- * @brief Frame loop that polls, updates stages, renders stages, and presents.
+ * @brief Frame loop that polls, runs preludes, updates stages, renders stages, and presents.
  *
  * The pipeline owns:
  * - one render pacing policy (@ref frame_schedule);
  * - one clock tree, updated once per frame with the real delta;
  * - one statistics collector;
+ * - an ordered list of @ref frame_prelude services run at frame start;
  * - an ordered list of @ref frame_stage entries, each with its own clock node
  *   and fixed-step scheduler.
  *
  * Pipeline responsibilities are deliberately small: obtain the frame delta,
- * poll platform events, update/render every stage, and present. Stage update
- * and render work lives in @ref frame_stage, so a game stage and a UI stage can
- * use different clocks and different step models in the same frame.
+ * poll platform events, run frame preludes, update/render every stage, and
+ * present. Prelude work lives in @ref frame_prelude; stage update and render
+ * work lives in @ref frame_stage, so a game stage and a UI stage can use
+ * different clocks and different step models in the same frame.
  *
  * Frame order:
  * 1. `on_poll()`.
  * 2. Update the clock tree with the frame delta.
- * 3. `on_frame_begin(frame_delta)`, then every enabled stage's `on_frame_begin`.
- * 4. Update every enabled stage in `update_order` (skipping `receive_update ==
- *    false`).
- * 5. `on_render_frame_begin()`, then every enabled stage's
+ * 3. Run every frame prelude in order with the frame delta and budget.
+ * 4. `on_frame_begin(frame_delta)`, then every enabled stage's `on_frame_begin`.
+ * 5. Update every enabled stage in `update_order` (skipping `receive_update ==
+ *    false`), passing the frame budget.
+ * 6. `on_render_frame_begin()`, then every enabled stage's
  *    `on_render_frame_begin`.
- * 6. Render every enabled stage in `render_order` (skipping `receive_render ==
- *    false`).
- * 7. Every enabled stage's `on_render_frame_end()`, then
+ * 7. Render every enabled stage in `render_order` (skipping `receive_render ==
+ *    false`), passing the frame budget.
+ * 8. Every enabled stage's `on_render_frame_end()`, then
  *    `on_render_frame_end()`.
- * 8. `on_present()`.
- * 9. Record statistics, stage snapshots, and automatic pacing.
+ * 9. `on_present()`.
+ * 10. Record statistics, stage snapshots, and automatic pacing.
  *
  * Lifecycle hooks run for every enabled stage, even when the corresponding
  * receive flag is false. Disabled stages run no callbacks. Ties in either order
@@ -148,24 +153,33 @@ public:
   /**
    * @brief Execute exactly one frame with a caller-supplied delta.
    *
-   * This is the deterministic frame primitive: it never sleeps and never
-   * throttles. The clock tree is advanced by `frame_delta`, then every stage
-   * updates and renders. Statistics are recorded and automatic pacing is
-   * evaluated.
-   *
-   * Quit semantics:
-   * - a quit from @ref on_poll skips clock update, lifecycle hooks, stages,
-   *   and present;
-   * - a quit from a frame-begin hook or stage update stops remaining updates
-   *   and skips render and present for the whole frame;
-   * - a quit from the render phase stops remaining renders, still runs the
-   *   render-frame-end hooks, and still presents and records statistics;
-   * - a quit from @ref on_present is observed after presentation.
+   * This overload uses @ref frame_budget::unlimited and is the deterministic
+   * primitive for tests and custom loops that do not need a time budget. It is
+   * passed to preludes and stage update/render callbacks.
    *
    * @param frame_delta Real seconds since the previous frame start.
    * @return True when the pipeline should continue, false when it has quit.
    */
   bool step_frame(double frame_delta);
+
+  /**
+   * @brief Execute exactly one frame with a caller-supplied delta and budget.
+   *
+   * This is the deterministic frame primitive: it never sleeps, never
+   * throttles, and never reads the pacing clock. The clock tree is advanced by
+   * `frame_delta`, then every prelude runs and every stage updates and renders.
+   * The same budget is passed to every prelude `on_frame_start`, `on_update`,
+   * and `on_render` callback; lifecycle hooks do not receive it. The budget is
+   * advisory and never causes the pipeline to skip a prelude or fixed step.
+   *
+   * Quit semantics match the single-argument overload.
+   *
+   * @param frame_delta Real seconds since the previous frame start.
+   * @param budget Frame budget valid for this call. The caller must keep its
+   * clock alive for the duration of the call.
+   * @return True when the pipeline should continue, false when it has quit.
+   */
+  bool step_frame(double frame_delta, frame_budget budget);
 
   /**
    * @brief Ask the loop to stop after the current frame.
@@ -250,8 +264,53 @@ public:
   /** @brief Monotonic clock used for wait deadlines. */
   const frame_clock& pacing_clock() const noexcept;
 
+  /**
+   * @brief Register a frame-start prelude.
+   *
+   * Preludes run once per frame after poll and the clock-tree update, before
+   * pipeline/stage `on_frame_begin` and before any stage update or render.
+   * Lower @p order values run first; equal orders keep registration order.
+   * Names are unique. Registration is rejected during a frame.
+   *
+   * @param name Unique diagnostic name.
+   * @param prelude Prelude to own; must not be null.
+   * @param order Execution priority; lower runs first.
+   * @return `std::errc::invalid_argument` for an empty name or null prelude,
+   * `std::errc::file_exists` for a duplicate name, or
+   * `std::errc::operation_in_progress` during a frame.
+   */
+  std::expected<void, std::error_code>
+  add_prelude(std::string_view name, std::unique_ptr<frame_prelude> prelude, int order = 0);
+
+  /**
+   * @brief Remove a frame-start prelude by name.
+   *
+   * @return `std::errc::no_such_file_or_directory` when no prelude has that
+   * name, or `std::errc::operation_in_progress` during a frame.
+   */
+  std::expected<void, std::error_code> erase_prelude(std::string_view name);
+
+  /** @brief Remove every prelude; a no-op during a frame. */
+  void clear_preludes() noexcept;
+
+  /** @brief Number of registered preludes. */
+  std::size_t prelude_count() const noexcept;
+
+  /** @brief Return whether a prelude with this name is registered. */
+  bool has_prelude(std::string_view name) const noexcept;
+
   /** @brief Sentinel returned by @ref stage_id when no stage has the name. */
   static constexpr uint64_t invalid_stage_id = 0;
+
+  /**
+   * @brief Per-prelude timing snapshots for the latest frame.
+   *
+   * The vector is in registration order and is updated in place each frame.
+   * Querying it performs no allocation. The name views and the reference are
+   * invalidated by prelude add/erase/clear; registration changes reset all
+   * recorded prelude times.
+   */
+  const std::vector<frame_prelude_stats>& prelude_stats() const noexcept;
 
   /**
    * @brief Per-stage snapshots for the latest frame.
@@ -368,7 +427,25 @@ private:
     uint64_t tick = 0;
   };
 
+  struct prelude_entry {
+    prelude_entry(std::string prelude_name, std::unique_ptr<frame_prelude> prelude_ptr, int prelude_order)
+        : name(std::move(prelude_name)), prelude(std::move(prelude_ptr)), order(prelude_order) {}
+
+    std::string name;
+    std::unique_ptr<frame_prelude> prelude;
+    int order = 0;
+  };
+
   void refresh_budget() noexcept;
+
+  /** @brief Rebuild the prelude execution order after registration changes. */
+  void rebuild_prelude_order();
+
+  /** @brief Rebuild per-prelude timing metadata after registration changes. */
+  void rebuild_prelude_stats();
+
+  /** @brief Run preludes in order; false when a prelude requested quit. */
+  bool run_preludes(double frame_delta, const frame_budget& budget);
 
   /** @brief Rebuild both order index lists after a stage is added or removed. */
   void rebuild_order_lists();
@@ -384,6 +461,9 @@ private:
   bool stepping_ = false;
   uint64_t tick_ = 0;
   uint64_t next_stage_id_ = 1;
+  std::vector<prelude_entry> preludes_;
+  std::vector<std::size_t> prelude_order_;
+  std::vector<frame_prelude_stats> prelude_stats_;
   std::vector<stage_entry> stages_;
   std::vector<std::size_t> update_order_;
   std::vector<std::size_t> render_order_;

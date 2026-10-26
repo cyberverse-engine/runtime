@@ -2,7 +2,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <functional>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -17,8 +19,10 @@
 using Catch::Approx;
 using cyberverse::runtime::clock_node;
 using cyberverse::runtime::clock_tree;
+using cyberverse::runtime::frame_budget;
 using cyberverse::runtime::frame_clock;
 using cyberverse::runtime::frame_pipeline;
+using cyberverse::runtime::frame_prelude;
 using cyberverse::runtime::frame_schedule;
 using cyberverse::runtime::frame_stage;
 using cyberverse::runtime::frame_stage_options;
@@ -69,10 +73,14 @@ public:
     }
   }
 
-  void on_update(double dt, uint64_t tick) override {
+  void on_update(double dt, uint64_t tick, const frame_budget& budget) override {
     ++updates;
     last_dt = dt;
     last_tick = tick;
+    update_budget_seen = true;
+    update_budget_unlimited = budget.is_unlimited();
+    update_budget_remaining = budget.remaining_seconds();
+    update_budget_used = budget.used_seconds();
     ticks.push_back(tick);
     if (events) {
       events->push_back(name + ":u");
@@ -88,10 +96,14 @@ public:
     }
   }
 
-  void on_render(double alpha, double dt) override {
+  void on_render(double dt, double alpha, const frame_budget& budget) override {
     ++renders;
     last_alpha = alpha;
     render_dt = dt;
+    render_budget_seen = true;
+    render_budget_unlimited = budget.is_unlimited();
+    render_budget_remaining = budget.remaining_seconds();
+    render_budget_used = budget.used_seconds();
     if (events) {
       events->push_back(name + ":r");
     }
@@ -117,10 +129,51 @@ public:
   double last_dt = -1.0;
   double last_alpha = -1.0;
   double render_dt = -1.0;
+  double update_budget_remaining = -1.0;
+  double update_budget_used = -1.0;
+  double render_budget_remaining = -1.0;
+  double render_budget_used = -1.0;
+  bool update_budget_seen = false;
+  bool render_budget_seen = false;
+  bool update_budget_unlimited = false;
+  bool render_budget_unlimited = false;
   uint64_t last_tick = 0;
   std::vector<uint64_t> ticks;
   int quit_after_updates = -1;
   int quit_after_renders = -1;
+};
+
+class test_prelude final : public frame_prelude {
+public:
+  void on_frame_start(double frame_delta, const frame_budget& budget) override {
+    ++calls;
+    last_frame_delta = frame_delta;
+    budget_seen = true;
+    budget_unlimited = budget.is_unlimited();
+    budget_remaining = budget.remaining_seconds();
+    budget_used = budget.used_seconds();
+    if (lifecycle) {
+      lifecycle->push_back(name);
+    }
+    if (hook) {
+      hook();
+    }
+  }
+
+  std::function<void()> hook;
+  std::vector<std::string>* lifecycle = nullptr;
+  std::string name;
+  int calls = 0;
+  double last_frame_delta = -1.0;
+  double budget_remaining = -1.0;
+  double budget_used = -1.0;
+  bool budget_seen = false;
+  bool budget_unlimited = false;
+};
+
+class throwing_prelude final : public frame_prelude {
+public:
+  void on_frame_start(double, const frame_budget&) override { throw std::runtime_error("prelude failure"); }
 };
 
 class test_pipeline final : public frame_pipeline {
@@ -226,6 +279,18 @@ test_stage* add_stage(frame_pipeline& pipeline,
   return raw;
 }
 
+test_prelude*
+add_prelude(frame_pipeline& pipeline, std::string name, int order = 0, std::vector<std::string>* lifecycle = nullptr) {
+  auto prelude = std::make_unique<test_prelude>();
+  test_prelude* raw = prelude.get();
+  raw->name = name;
+  raw->lifecycle = lifecycle;
+
+  auto result = pipeline.add_prelude(name, std::move(prelude), order);
+  REQUIRE(result.has_value());
+  return raw;
+}
+
 } // namespace
 
 TEST_CASE("frame_pipeline executes a complete fixed frame", "[runtime][pipeline]") {
@@ -246,6 +311,281 @@ TEST_CASE("frame_pipeline executes a complete fixed frame", "[runtime][pipeline]
   CHECK(pipeline.tick_count() == 1);
   CHECK(pipeline.stats().total_frames() == 1);
   CHECK(pipeline.stats().budget() == Approx(1.0 / 60.0));
+  CHECK(pipeline.stats().smoothed_prelude_time() == Approx(0.0));
+}
+
+TEST_CASE("frame_pipeline runs preludes in order before frame hooks", "[runtime][pipeline][prelude]") {
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+  std::vector<std::string> events;
+  pipeline.lifecycle = &events;
+
+  auto* late = add_prelude(pipeline, "late", 10, &events);
+  auto* first = add_prelude(pipeline, "first", 0, &events);
+  auto* second = add_prelude(pipeline, "second", 0, &events);
+  add_stage(pipeline, "game", true, tree->ensure("game"), {}, nullptr, &events);
+
+  CHECK(pipeline.step_frame(1.0 / 60.0));
+
+  CHECK(events == std::vector<std::string>{ "poll",
+                                            "first",
+                                            "second",
+                                            "late",
+                                            "pipeline:fb",
+                                            "game:fb",
+                                            "game:u",
+                                            "pipeline:rb",
+                                            "game:rb",
+                                            "game:r",
+                                            "game:re",
+                                            "pipeline:re",
+                                            "present" });
+  CHECK(first->calls == 1);
+  CHECK(second->calls == 1);
+  CHECK(late->calls == 1);
+}
+
+TEST_CASE("frame_pipeline preludes use an unlimited budget by default", "[runtime][pipeline][prelude]") {
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+  auto* prelude = add_prelude(pipeline, "prelude");
+
+  CHECK(pipeline.step_frame(1.0 / 60.0));
+
+  CHECK(prelude->calls == 1);
+  CHECK(prelude->budget_seen);
+  CHECK(prelude->budget_unlimited);
+  CHECK(prelude->budget_remaining == std::numeric_limits<double>::max());
+  CHECK(prelude->budget_used == Approx(0.0));
+  CHECK(prelude->last_frame_delta == Approx(1.0 / 60.0));
+}
+
+TEST_CASE("frame_pipeline preludes receive the injected budget", "[runtime][pipeline][prelude]") {
+  manual_frame_clock budget_clock;
+  frame_budget budget(1.0, budget_clock);
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+  auto* prelude = add_prelude(pipeline, "prelude");
+  prelude->hook = [&budget_clock] {
+    budget_clock.advance(0.2);
+  };
+  auto* game = add_stage(pipeline, "game", true, tree->ensure("game"));
+
+  CHECK(pipeline.step_frame(1.0 / 60.0, budget));
+
+  CHECK_FALSE(prelude->budget_unlimited);
+  CHECK(prelude->budget_used == Approx(0.0));
+  CHECK(prelude->budget_remaining == Approx(1.0));
+  CHECK(game->update_budget_used == Approx(0.2));
+  CHECK(game->update_budget_remaining == Approx(0.8));
+}
+
+TEST_CASE("frame_pipeline reports prelude timing statistics", "[runtime][pipeline][prelude][stats]") {
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+  add_prelude(pipeline, "first", 2);
+  add_prelude(pipeline, "second", 1);
+
+  CHECK(pipeline.step_frame(1.0 / 60.0));
+
+  const auto& stats = pipeline.prelude_stats();
+  REQUIRE(stats.size() == 2);
+  CHECK(stats[0].name == "first");
+  CHECK(stats[0].order == 2);
+  CHECK(stats[0].time >= 0.0);
+  CHECK(stats[1].name == "second");
+  CHECK(stats[1].order == 1);
+  CHECK(stats[1].time >= 0.0);
+  CHECK(pipeline.stats().total_frames() == 1);
+  CHECK(pipeline.stats().smoothed_prelude_time() >= 0.0);
+  CHECK(pipeline.stats().prelude_utilization() >= 0.0);
+}
+
+TEST_CASE("frame_pipeline preludes run even when the frame budget is exhausted", "[runtime][pipeline][prelude]") {
+  manual_frame_clock budget_clock;
+  frame_budget exhausted(0.0, budget_clock);
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+  auto* first = add_prelude(pipeline, "first");
+  auto* second = add_prelude(pipeline, "second");
+  auto* game = add_stage(pipeline, "game", true, tree->ensure("game"));
+
+  CHECK(pipeline.step_frame(0.05, exhausted));
+
+  CHECK(first->calls == 1);
+  CHECK(second->calls == 1);
+  CHECK(game->updates == 3);
+  CHECK(game->renders == 1);
+  CHECK(game->update_budget_remaining == Approx(0.0));
+}
+
+TEST_CASE("frame_pipeline prelude quit stops the rest of the frame", "[runtime][pipeline][prelude]") {
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+  auto* prelude = add_prelude(pipeline, "prelude");
+  prelude->hook = [&pipeline] {
+    pipeline.request_quit();
+  };
+  auto* game = add_stage(pipeline, "game", true, tree->ensure("game"));
+
+  CHECK_FALSE(pipeline.step_frame(1.0 / 60.0));
+
+  CHECK(prelude->calls == 1);
+  CHECK(pipeline.polls == 1);
+  CHECK(pipeline.presents == 0);
+  CHECK(game->frame_begins == 0);
+  CHECK(game->updates == 0);
+  CHECK(game->renders == 0);
+}
+
+TEST_CASE("frame_pipeline rejects prelude mutation during a frame", "[runtime][pipeline][prelude]") {
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+
+  bool add_rejected = false;
+  bool erase_rejected = false;
+  bool clear_was_noop = false;
+  auto* outer = add_prelude(pipeline, "outer");
+  outer->hook = [&] {
+    auto added = pipeline.add_prelude("inner", std::make_unique<test_prelude>());
+    add_rejected = !added && added.error() == std::make_error_code(std::errc::operation_in_progress);
+
+    auto erased = pipeline.erase_prelude("outer");
+    erase_rejected = !erased && erased.error() == std::make_error_code(std::errc::operation_in_progress);
+
+    pipeline.clear_preludes();
+    clear_was_noop = pipeline.prelude_count() == 1;
+  };
+
+  CHECK(pipeline.step_frame(1.0 / 60.0));
+  CHECK(add_rejected);
+  CHECK(erase_rejected);
+  CHECK(clear_was_noop);
+  CHECK(pipeline.prelude_count() == 1);
+}
+
+TEST_CASE("frame_pipeline validates prelude registration", "[runtime][pipeline][prelude]") {
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+
+  auto empty = pipeline.add_prelude("", std::make_unique<test_prelude>());
+  CHECK_FALSE(empty.has_value());
+  CHECK(empty.error() == std::make_error_code(std::errc::invalid_argument));
+
+  auto null = pipeline.add_prelude("null", nullptr);
+  CHECK_FALSE(null.has_value());
+  CHECK(null.error() == std::make_error_code(std::errc::invalid_argument));
+
+  CHECK(pipeline.add_prelude("valid", std::make_unique<test_prelude>()).has_value());
+  auto duplicate = pipeline.add_prelude("valid", std::make_unique<test_prelude>());
+  CHECK_FALSE(duplicate.has_value());
+  CHECK(duplicate.error() == std::make_error_code(std::errc::file_exists));
+  CHECK(pipeline.prelude_count() == 1);
+  CHECK(pipeline.has_prelude("valid"));
+
+  auto missing = pipeline.erase_prelude("missing");
+  CHECK_FALSE(missing.has_value());
+  CHECK(missing.error() == std::make_error_code(std::errc::no_such_file_or_directory));
+
+  pipeline.clear_preludes();
+  CHECK(pipeline.prelude_count() == 0);
+  CHECK(pipeline.prelude_stats().empty());
+  CHECK_FALSE(pipeline.has_prelude("valid"));
+}
+
+TEST_CASE("frame_pipeline propagates prelude exceptions", "[runtime][pipeline][prelude]") {
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+  CHECK(pipeline.add_prelude("throwing", std::make_unique<throwing_prelude>()).has_value());
+
+  CHECK_THROWS_AS(pipeline.step_frame(1.0 / 60.0), std::runtime_error);
+  CHECK(pipeline.presents == 0);
+  CHECK(pipeline.stats().total_frames() == 0);
+}
+
+TEST_CASE("frame_pipeline gives callbacks an unlimited budget by default", "[runtime][pipeline][budget]") {
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+  auto* game = add_stage(pipeline, "game", true, tree->ensure("game"));
+
+  CHECK(pipeline.step_frame(1.0 / 60.0));
+
+  CHECK(game->update_budget_seen);
+  CHECK(game->render_budget_seen);
+  CHECK(game->update_budget_unlimited);
+  CHECK(game->render_budget_unlimited);
+  CHECK(game->update_budget_remaining == std::numeric_limits<double>::max());
+  CHECK(game->render_budget_remaining == std::numeric_limits<double>::max());
+  CHECK(game->update_budget_used == Approx(0.0));
+  CHECK(game->render_budget_used == Approx(0.0));
+}
+
+TEST_CASE("frame_pipeline shares an injected budget across stages", "[runtime][pipeline][budget]") {
+  manual_frame_clock budget_clock;
+  frame_budget budget(1.0, budget_clock);
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+  auto* first = add_stage(pipeline, "first", true, tree->ensure("first"));
+  auto* second = add_stage(pipeline, "second", true, tree->ensure("second"));
+  first->update_hook = [&budget_clock] {
+    budget_clock.advance(0.25);
+  };
+
+  CHECK(pipeline.step_frame(1.0 / 60.0, budget));
+
+  CHECK_FALSE(first->update_budget_unlimited);
+  CHECK(first->update_budget_used == Approx(0.0));
+  CHECK(first->render_budget_used == Approx(0.25));
+  CHECK(second->update_budget_used == Approx(0.25));
+  CHECK(second->update_budget_remaining == Approx(0.75));
+  CHECK(second->render_budget_used == Approx(0.25));
+}
+
+TEST_CASE("frame_pipeline does not skip fixed steps when the budget is exhausted", "[runtime][pipeline][budget]") {
+  manual_frame_clock budget_clock;
+  frame_budget exhausted(0.0, budget_clock);
+  auto tree = std::make_shared<clock_tree>();
+  test_pipeline pipeline(frame_schedule{}, tree);
+  auto* game = add_stage(pipeline, "game", true, tree->ensure("game"));
+
+  CHECK(pipeline.step_frame(0.05, exhausted));
+
+  CHECK(game->updates == 3);
+  CHECK(game->renders == 1);
+  CHECK(game->update_budget_remaining == Approx(0.0));
+}
+
+TEST_CASE("frame_pipeline run creates a finite budget", "[runtime][pipeline][budget][pacing]") {
+  auto tree = std::make_shared<clock_tree>();
+  auto pacing = std::make_shared<manual_frame_clock>();
+  test_pipeline pipeline(frame_schedule{}, tree, pacing);
+  pipeline.manual_clock = pacing.get();
+  pipeline.quit_after_presents = 1;
+  auto* game = add_stage(pipeline, "game", true, tree->ensure("game"));
+
+  pipeline.run();
+
+  CHECK(game->update_budget_seen);
+  CHECK_FALSE(game->update_budget_unlimited);
+  CHECK(game->update_budget_remaining == Approx(1.0 / 60.0));
+}
+
+TEST_CASE("frame_pipeline run uses an unlimited budget for an unlimited schedule",
+          "[runtime][pipeline][budget][pacing]") {
+  schedule_config config;
+  config.target_render_hz = 0.0;
+  auto tree = std::make_shared<clock_tree>();
+  auto pacing = std::make_shared<manual_frame_clock>();
+  test_pipeline pipeline(frame_schedule(config), tree, pacing);
+  pipeline.manual_clock = pacing.get();
+  pipeline.quit_after_presents = 1;
+  auto* game = add_stage(pipeline, "game", true, tree->ensure("game"));
+
+  pipeline.run();
+
+  CHECK(game->update_budget_seen);
+  CHECK(game->update_budget_unlimited);
+  CHECK(game->update_budget_remaining == std::numeric_limits<double>::max());
 }
 
 TEST_CASE("frame_pipeline renders without a logic step on fractional frames", "[runtime][pipeline]") {

@@ -33,6 +33,10 @@ double clamp_ratio(double ratio) noexcept {
 
 frame_budget::frame_budget(double seconds, frame_clock& clock) noexcept : frame_budget(seconds, clock, clock.now()) {}
 
+frame_budget::frame_budget() noexcept : budget_seconds_(kUnlimitedBudget) {}
+
+frame_budget frame_budget::unlimited() noexcept { return frame_budget{}; }
+
 frame_budget::frame_budget(double seconds, frame_clock& clock, double start_seconds) noexcept
     : clock_(&clock)
     , start_seconds_(start_seconds)
@@ -42,9 +46,17 @@ bool frame_budget::is_unlimited() const noexcept { return budget_seconds_ < 0.0;
 
 bool frame_budget::has_remaining() const noexcept { return is_unlimited() || used_seconds() < budget_seconds_; }
 
-double frame_budget::remaining_seconds() const noexcept { return remaining_at(current_seconds()); }
+double frame_budget::remaining_seconds() const noexcept {
+  if (is_unlimited()) {
+    return std::numeric_limits<double>::max();
+  }
+  return remaining_at(current_seconds());
+}
 
 double frame_budget::used_seconds() const noexcept {
+  if (clock_ == nullptr) {
+    return 0.0;
+  }
   const double elapsed = current_seconds() - start_seconds_;
   return elapsed > 0.0 ? elapsed : 0.0;
 }
@@ -54,17 +66,23 @@ double frame_budget::deadline_seconds() const noexcept {
 }
 
 frame_budget frame_budget::sub(double ratio) const noexcept {
-  const double now = current_seconds();
   if (is_unlimited()) {
-    return frame_budget(kUnlimitedBudget, *clock_, now);
+    if (clock_ == nullptr) {
+      return unlimited();
+    }
+    return frame_budget(kUnlimitedBudget, *clock_, current_seconds());
   }
 
+  const double now = current_seconds();
   const double child_seconds = remaining_at(now) * clamp_ratio(ratio);
   return frame_budget(child_seconds, *clock_, now);
 }
 
 frame_budget frame_budget::share(double ratio) const noexcept {
   if (is_unlimited()) {
+    if (clock_ == nullptr) {
+      return unlimited();
+    }
     return frame_budget(kUnlimitedBudget, *clock_, start_seconds_);
   }
 
@@ -72,7 +90,7 @@ frame_budget frame_budget::share(double ratio) const noexcept {
   return frame_budget(child_seconds, *clock_, start_seconds_);
 }
 
-double frame_budget::current_seconds() const noexcept { return clock_->now(); }
+double frame_budget::current_seconds() const noexcept { return clock_ != nullptr ? clock_->now() : 0.0; }
 
 double frame_budget::remaining_at(double now) const noexcept {
   if (is_unlimited()) {

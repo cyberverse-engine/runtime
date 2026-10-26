@@ -14,9 +14,11 @@ TEST_CASE("frame_stats starts empty", "[runtime][stats]") {
   frame_stats stats;
 
   CHECK(stats.smoothed_frame_time() == Approx(0.0));
+  CHECK(stats.smoothed_prelude_time() == Approx(0.0));
   CHECK(stats.smoothed_logic_time() == Approx(0.0));
   CHECK(stats.smoothed_render_time() == Approx(0.0));
   CHECK(stats.average_fps() == Approx(0.0));
+  CHECK(stats.prelude_utilization() == Approx(0.0));
   CHECK(stats.logic_utilization() == Approx(0.0));
   CHECK(stats.render_utilization() == Approx(0.0));
   CHECK(stats.total_frames() == 0);
@@ -27,9 +29,10 @@ TEST_CASE("frame_stats starts empty", "[runtime][stats]") {
 
 TEST_CASE("frame_stats initializes the EMA from the first sample", "[runtime][stats]") {
   frame_stats stats(0.5, 1.0);
-  stats.record_frame({ 0.020, 0.004, 0.006, 2 });
+  stats.record_frame({ 0.020, 0.004, 0.006, 2, 0.002 });
 
   CHECK(stats.smoothed_frame_time() == Approx(0.020));
+  CHECK(stats.smoothed_prelude_time() == Approx(0.002));
   CHECK(stats.smoothed_logic_time() == Approx(0.004));
   CHECK(stats.smoothed_render_time() == Approx(0.006));
   CHECK(stats.average_fps() == Approx(50.0));
@@ -40,10 +43,11 @@ TEST_CASE("frame_stats initializes the EMA from the first sample", "[runtime][st
 
 TEST_CASE("frame_stats smooths subsequent samples", "[runtime][stats]") {
   frame_stats stats(0.5, 1.0);
-  stats.record_frame({ 0.010, 0.002, 0.003, 1 });
-  stats.record_frame({ 0.020, 0.004, 0.006, 2 });
+  stats.record_frame({ 0.010, 0.002, 0.003, 1, 0.001 });
+  stats.record_frame({ 0.020, 0.004, 0.006, 2, 0.003 });
 
   CHECK(stats.smoothed_frame_time() == Approx(0.015));
+  CHECK(stats.smoothed_prelude_time() == Approx(0.002));
   CHECK(stats.smoothed_logic_time() == Approx(0.003));
   CHECK(stats.smoothed_render_time() == Approx(0.0045));
   CHECK(stats.average_fps() == Approx(1.0 / 0.015));
@@ -63,14 +67,16 @@ TEST_CASE("frame_stats normalizes the EMA alpha", "[runtime][stats]") {
 
 TEST_CASE("frame_stats reports utilization against the budget", "[runtime][stats]") {
   frame_stats stats(0.5, 0.020);
-  stats.record_frame({ 0.020, 0.005, 0.010, 1 });
+  stats.record_frame({ 0.020, 0.005, 0.010, 1, 0.002 });
 
   CHECK(stats.budget() == Approx(0.020));
+  CHECK(stats.prelude_utilization() == Approx(0.1));
   CHECK(stats.logic_utilization() == Approx(0.25));
   CHECK(stats.render_utilization() == Approx(0.5));
 
   stats.set_budget(0.010);
   CHECK(stats.budget() == Approx(0.010));
+  CHECK(stats.prelude_utilization() == Approx(0.2));
   CHECK(stats.logic_utilization() == Approx(0.5));
   CHECK(stats.render_utilization() == Approx(1.0));
 
@@ -129,9 +135,11 @@ TEST_CASE("frame_stats changing the budget clears the over-budget streak", "[run
 
 TEST_CASE("frame_stats sanitizes invalid samples", "[runtime][stats]") {
   frame_stats stats(0.5, 1.0);
-  stats.record_frame({ -1.0, std::numeric_limits<double>::quiet_NaN(), -0.5, -3 });
+  stats.record_frame(
+      { -1.0, std::numeric_limits<double>::quiet_NaN(), -0.5, -3, std::numeric_limits<double>::quiet_NaN() });
 
   CHECK(stats.smoothed_frame_time() == Approx(0.0));
+  CHECK(stats.smoothed_prelude_time() == Approx(0.0));
   CHECK(stats.smoothed_logic_time() == Approx(0.0));
   CHECK(stats.smoothed_render_time() == Approx(0.0));
   CHECK(stats.average_fps() == Approx(0.0));
@@ -140,13 +148,14 @@ TEST_CASE("frame_stats sanitizes invalid samples", "[runtime][stats]") {
 
 TEST_CASE("frame_stats reset keeps configuration", "[runtime][stats]") {
   frame_stats stats(0.5, 0.020);
-  stats.record_frame({ 0.020, 0.005, 0.005, 1 });
-  stats.record_frame({ 0.040, 0.005, 0.005, 1 });
+  stats.record_frame({ 0.020, 0.005, 0.005, 1, 0.002 });
+  stats.record_frame({ 0.040, 0.005, 0.005, 1, 0.004 });
   REQUIRE(stats.total_frames() == 2);
 
   stats.reset();
 
   CHECK(stats.smoothed_frame_time() == Approx(0.0));
+  CHECK(stats.smoothed_prelude_time() == Approx(0.0));
   CHECK(stats.smoothed_logic_time() == Approx(0.0));
   CHECK(stats.smoothed_render_time() == Approx(0.0));
   CHECK(stats.average_fps() == Approx(0.0));

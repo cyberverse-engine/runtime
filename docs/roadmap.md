@@ -36,18 +36,20 @@
 | 渲染限速 | `frame_schedule` 保留 `target_render_hz`、无限模式、`should_throttle` 和自动帧率稳定；`target_frame_time` 与 `should_throttle` 给出等待策略。 |
 | 固定步长 | `frame_schedule::fixed_step_scheduler` 独立持有累加器，默认实时继承 `frame_schedule` 的逻辑配置；`fixed_step_overrides` 只固定显式覆盖的 `target_logic_hz`、`max_frame_time`、`max_logic_steps_per_frame`，其余字段继续跟随 schedule；每个 fixed-step stage 独享 scheduler。 |
 | 死亡螺旋防护 | scheduler 钳制 `max_frame_time`，限制 `max_logic_steps_per_frame`，超过时丢弃多余整步并保留小数相位。 |
-| 帧阶段 | `frame_stage` 区分 fixed/variable；fixed 每帧零到多次 `on_update` 加一次 `on_render`，variable 每帧一次 `on_update` 和一次 `on_render(1.0, dt)`。 |
+| 帧阶段 | `frame_stage` 区分 fixed/variable；fixed 每帧零到多次 `on_update` 加一次 `on_render`，variable 每帧一次 `on_update` 和一次 `on_render(dt, 1.0)`；`on_update`/`on_render` 接收共享 `frame_budget`，生命周期钩子不接收。 |
 | 阶段生命周期 | 稳定且不复用的 stage id；`update_order`/`render_order` 独立优先级；`receive_update`/`receive_render` 门控；`enabled` 整体启停；`group` 批量启停；帧内修改返回 `operation_in_progress`。 |
 | 帧生命周期 | pipeline 与 stage 提供 `on_frame_begin`、`on_render_frame_begin`、`on_render_frame_end`；仅 enabled stage 执行生命周期钩子。 |
+| 帧开始服务 | `frame_prelude` 在 poll/clock update 后、pipeline/stage begin 与 update/render 前执行；接收 `frame_delta` 和共享 `frame_budget`，多个库可按 order 注册。 |
 | 阶段统计 | `stage_stats()` 以注册顺序返回零分配只读快照：id、group、enabled、receive、update/render 时间、fixed steps、alpha、clock delta、tick。 |
+| Prelude 统计 | `prelude_stats()` 以注册顺序返回 name/order/最新执行时间；`frame_stats` 增加聚合 prelude EMA 与 `prelude_utilization()`。 |
 | 多时钟阶段 | `frame_pipeline` 每帧更新时钟树；每个 stage 绑定一个 `clock_node`，游戏时钟暂停/慢放时 UI 时钟可继续。 |
 | 帧循环 | `frame_pipeline` 负责 `tick_clock`、poll、生命周期和 present；stage 负责 update/render；按 update/render 顺序调度后 present。 |
 | 渲染线程识别 | `this_thread` 提供 thread-local 渲染线程角色；`frame_pipeline::step_frame` 在 `on_poll` 前标记调用线程，`is_this_render_thread()` 可在 stage/present 中查询。 |
 | 任务基础设施 | `task_queue<T>` 提供渲染线程无互斥锁通道和任意线程互斥通道，支持优先弹出、并发生产，以及只排空 any lane 的 RAII `pop_locker`；`frame_budget` 必须注入 `frame_clock`，提供剩余/已用时间、无限预算、绝对 deadline、剩余时间子预算和帧对齐 share。 |
 | 退出语义 | poll 退出跳过整帧；frame-begin/update 退出跳过剩余 update/render/present；render 退出停止剩余 render，仍执行 render-end、present 并记录统计。 |
 | 确定性 pacing | `frame_clock` + `steady_frame_clock`；`run()` 维护绝对 deadline，默认 sleep-until，小过睡缩短下一帧等待，大停顿后重新同步；测试可注入 manual clock。 |
-| 统计 | `frame_stats` 维护聚合 EMA、FPS、预算利用率、抖动/连续超预算；固定滚动窗口（默认 120，最大 256）提供 min/max/percentile/budget margin，查询不分配堆内存。 |
-| 验证 | 102 个 Catch2 测试覆盖时钟继承/操作/调试、阶段 id/options/groups/reentrancy、每 stage 频率、scheduler 实时继承/部分覆盖、阶段统计、生命周期、独立 scheduler、渲染线程识别、任务队列双通道/并发生产/RAII pop_locker/move-only、帧预算/子预算/share/deadline、退出、pacing/过睡、自适应、统计窗口和 EMA；17 组 Google Benchmark 覆盖 scheduler、时钟树、统计、阶段查询、优先级、过滤和多阶段整帧开销。 |
+| 统计 | `frame_stats` 维护 frame/prelude/logic/render 聚合 EMA、FPS、分阶段预算利用率、抖动/连续超预算；固定滚动窗口（默认 120，最大 256）提供 min/max/percentile/budget margin，查询不分配堆内存。 |
+| 验证 | 117 个 Catch2 测试覆盖时钟继承/操作/调试、阶段 id/options/groups/reentrancy、每 stage 频率、scheduler 实时继承/部分覆盖、阶段统计、生命周期、独立 scheduler、渲染线程识别、任务队列双通道/并发生产/RAII pop_locker/move-only、帧预算/子预算/share/deadline/回调注入、frame prelude 顺序/预算/计时/退出/异常、退出、pacing/过睡、自适应、统计窗口和 EMA；17 组 Google Benchmark 覆盖 scheduler、时钟树、统计、阶段查询、优先级、过滤和多阶段整帧开销。 |
 | 依赖与打包 | 仅 C++ 标准库与 `Threads::Threads`；尚未提供 install/export 包、版本头和 CI。 |
 
 ### 已知限制
@@ -95,7 +97,8 @@ v0.2 的 P0/P1 工作已落地并通过测试：
 | 项目 | 状态 |
 | --- | --- |
 | `task_queue<T>`：渲染线程无互斥锁通道 + 任意线程互斥通道、渲染优先、并发生产、RAII pop_locker 只排空 any lane | 完成 |
-| `frame_budget`：必须注入 `frame_clock`、剩余/已用时间、无限预算、deadline、剩余时间子预算、帧对齐 share | 完成 |
+| `frame_budget`：必须注入 `frame_clock`、显式无时钟 `unlimited()`、剩余/已用时间、无限预算、deadline、剩余时间子预算、帧对齐 share、通过 `step_frame(dt, budget)` 注入 `on_update`/`on_render` | 完成 |
+| `frame_prelude`：有序、可注册的帧开始服务；在 poll/clock update 后、所有 begin/update/render 前执行并接收 budget；提供 per-prelude 与聚合计时 | 完成 |
 
 ### 设计决策
 
@@ -132,6 +135,15 @@ v0.2 的 P0/P1 工作已落地并通过测试：
   `steady_clock` 混用。`sub(ratio)` 取当前剩余时间的比例并从调用时刻重新计时；`share(ratio)`
   取父总预算的比例并共享父起点，因此兄弟 share 的 deadline 都是 `start + total * ratio`。
   比例为 0/负数/NaN 时得到已耗尽子预算，比例大于 1 时按 1 处理。
+- **预算回调边界：** 只把 budget 传给 `on_update`/`on_render` 和 `frame_prelude`，不传给
+  生命周期钩子、poll 和 present。生命周期钩子是 `noexcept` 的编排钩子，poll/present 可能阻塞；
+  budget 是 advisory，不会让 pipeline 跳过 prelude、fixed step 或 present。`step_frame(dt)`
+  使用 `unlimited()`，`step_frame(dt, budget)` 接受调用方预算；`run()` 在节流等待后用目标帧
+  时间创建有限预算。
+- **帧开始服务：** 不把资源上传/GPU 检测塞进 `on_frame_begin`，而是提供独立的
+  `frame_prelude` 列表。这样多个库可各自注册、按 order 排序、共享 frame budget，且与 stage
+  的时钟/scheduler/render 语义解耦。prelude 在 poll 和 clock update 之后、所有 pipeline/stage
+  begin 与 update/render 之前运行；异常传播，quit 跳过本帧剩余工作。
 
 ## 里程碑
 
@@ -174,7 +186,7 @@ v0.2 的 P0/P1 工作已落地并通过测试：
 
 - **平台适配示例（P0）。** 在示例中把 `platform` 的事件泵、计时器和窗口关闭状态接到
   `frame_pipeline`；适配层放在示例或 `render-core`，不把 `platform` 链接进 `runtime`。
-- **渲染器适配契约（P0）。** 明确 stage `on_render(alpha, dt)` 与 `on_present()` 的职责、
+- **渲染器适配契约（P0）。** 明确 stage `on_render(dt, alpha)` 与 `on_present()` 的职责、
   GPU 同步点、帧号传递、逐 stage 渲染顺序和动态分辨率/降载信号；渲染器不反向驱动时钟树。
 - **逐 stage 遥测（P1）。** 基于 `stage_stats()` 提供只读快照和可选 CSV/JSON 导出；帧时间、
   预算、FPS、各 stage 耗时、时钟 delta、暂停/缩放状态可供 overlay 使用。
@@ -216,8 +228,9 @@ README、AGENTS 和测试。
 - `frame_pipeline::step_frame` 在 `on_poll` 前把调用线程标记为渲染线程；
   `is_this_render_thread()` 读取 thread-local 状态，初始为 false，线程生命周期内保持 true，
   不绑定 pipeline 实例，也没有解除接口。`run()` 通过 `step_frame` 获得相同标记。
-- `frame_budget` 必须通过 `frame_clock` 构造，不提供默认构造或墙钟路径；clock 生命周期必须
-  覆盖 budget 及所有子预算。负值/非有限预算为无限，`has_remaining()` 恒为 true，
+- `frame_budget` 必须通过 `frame_clock` 构造，不提供公开默认构造或墙钟路径；
+  `frame_budget::unlimited()` 提供显式的无时钟无限预算（used 为 0，deadline 为正无穷，
+  `sub()`/`share()` 保持无时钟无限）。有限预算的 clock 生命周期必须覆盖 budget 及所有子预算。负值/非有限预算为无限，`has_remaining()` 恒为 true，
   `remaining_seconds()` 返回 `std::numeric_limits<double>::max()`，`is_unlimited()` 为 true，
   `deadline_seconds()` 返回正无穷。有限剩余时间和已用时间都 clamp 到非负；`deadline_seconds()`
   返回 `start + budget`。`sub(ratio)` 从当前剩余时间取比例并从调用时刻重新计时；
@@ -228,16 +241,29 @@ README、AGENTS 和测试。
   `try_pop()` 只弹 any lane；locker 必须由创建线程持有到排空结束，存活期间不得调用 queue 级
   `try_pop`。该类型假设同一时间只有一个活跃渲染线程，且 `T` 可移动、可移动赋值。
 - `target_render_hz == 0` 表示无限模式；`target_frame_time()` 返回 0。
-- fixed stage 每帧执行零到多次 `on_update(logic_step, stage_tick)` 和一次
-  `on_render(alpha, clock_delta)`；variable stage 每帧执行一次 `on_update(clock_delta,
-  stage_tick)` 和一次 `on_render(1.0, clock_delta)`。
+- fixed stage 每帧执行零到多次 `on_update(logic_step, stage_tick, budget)` 和一次
+  `on_render(clock_delta, alpha, budget)`；variable stage 每帧执行一次
+  `on_update(clock_delta, stage_tick, budget)` 和一次
+  `on_render(clock_delta, 1.0, budget)`。只有 update/render 接收 budget；生命周期钩子、
+  poll 和 present 不接收。budget 是 advisory，pipeline 不会因耗尽而跳过 fixed step 或 present。
+- `frame_pipeline::step_frame(dt)` 使用 `frame_budget::unlimited()`；
+  `step_frame(dt, budget)` 将调用方预算传给 `on_update`/`on_render`，本身不读 pacing clock。
+  `run()` 在节流等待与 resync 之后按 `next_deadline + target - now` 创建有限预算；无限
+  schedule 使用 `frame_budget::unlimited()`。
+- `frame_prelude` 在 poll/clock update 后、pipeline/stage begin 与 update/render 前执行，接收
+  `(frame_delta, const frame_budget&)`；多个 prelude 按 order 升序、同 order 按注册顺序执行。
+  帧内 add/erase 返回 `operation_in_progress`，`clear_preludes` 为 no-op；prelude 请求 quit
+  会跳过本帧剩余工作，异常传播且该帧不记录统计。`prelude_stats()` 以注册顺序返回
+  name/order/latest time；`frame_stats` 的 `prelude_time` EMA 与 `prelude_utilization()` 提供
+  聚合占用。名称视图在 prelude add/erase/clear 后失效，注册变化会重置已记录的 prelude 时间。
 - `frame_stage_options` 的 update/render 顺序独立，按升序执行，同值按注册顺序；`receive_update`
   只门控 scheduler 与 `on_update`，`receive_render` 只门控 `on_render`；`enabled=false` 跳过所有
   stage 回调；`group` 用于批量启停。
-- 帧顺序固定为：poll → clock tree update → pipeline `on_frame_begin` → stage `on_frame_begin`
-  （update 顺序） → 全部 stage update（update 顺序） → pipeline `on_render_frame_begin` → stage
-  `on_render_frame_begin`（render 顺序） → 全部 stage render（render 顺序） → stage
-  `on_render_frame_end`（render 顺序） → pipeline `on_render_frame_end` → present → 统计/自适应。
+- 帧顺序固定为：poll → clock tree update → frame preludes（order） → pipeline `on_frame_begin`
+  → stage `on_frame_begin`（update 顺序） → 全部 stage update（update 顺序） → pipeline
+  `on_render_frame_begin` → stage `on_render_frame_begin`（render 顺序） → 全部 stage render
+  （render 顺序） → stage `on_render_frame_end`（render 顺序） → pipeline
+  `on_render_frame_end` → present → 统计/自适应。
 - stage id 单调递增且不复用；`stage_stats()` 查询零分配，名称视图在 add/erase/clear 后失效；
   帧内 add/erase/options/enable 修改返回 `operation_in_progress`，`clear_stages` 为 no-op。
 - quit 语义固定：poll 退出跳过整帧；frame-begin/update 退出跳过剩余 update/render/present；
@@ -245,8 +271,8 @@ README、AGENTS 和测试。
   呈现后观察。
 - `tick_clock()` 返回自上次调用以来的真实秒数；`run()` 每轮调用一次，使用 `frame_clock` 的
   绝对 deadline 进行等待；`step_frame(dt)` 不使用 pacing clock、不 sleep。
-- `frame_stats` 首样本建立 EMA 基线；滚动窗口容量固定；percentile 查询无堆分配；`set_budget`
-  重置超预算计数但保留 EMA。
+- `frame_stats` 首样本建立 frame/prelude/logic/render 四个 EMA 基线；滚动窗口容量固定；
+  percentile 查询无堆分配；`set_budget` 重置超预算计数但保留 EMA。
 - `request_quit()`/`should_quit()` 是唯一的跨线程入口；其余状态只允许循环线程访问。
 - 运行时热路径不创建线程、不分配内存、不做无界阻塞；任何会改变这一点的能力必须显式启用并
   在文档中标注。

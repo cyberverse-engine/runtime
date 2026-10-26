@@ -40,6 +40,16 @@ public:
    */
   frame_budget(double seconds, frame_clock& clock) noexcept;
 
+  /**
+   * @brief Create an unlimited budget without a clock.
+   *
+   * Unlike the clock-bound constructor, this budget has no time source. It is
+   * always unlimited, used_seconds() is zero, and sub()/share() return another
+   * unlimited budget without a clock. It is intended for default frame contexts
+   * and callers that explicitly do not want a frame-time limit.
+   */
+  [[nodiscard]] static frame_budget unlimited() noexcept;
+
   /** @brief Return whether this budget is unlimited. */
   bool is_unlimited() const noexcept;
 
@@ -100,6 +110,7 @@ public:
   frame_budget share(double ratio) const noexcept;
 
 private:
+  frame_budget() noexcept;
   frame_budget(double seconds, frame_clock& clock, double start_seconds) noexcept;
 
   double current_seconds() const noexcept;

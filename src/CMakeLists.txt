@@ -14,6 +14,7 @@ set(
   cyberverse/runtime/frame_budget.hpp
   cyberverse/runtime/frame_clock.hpp
   cyberverse/runtime/frame_pipeline.hpp
+  cyberverse/runtime/frame_prelude.hpp
   cyberverse/runtime/frame_schedule.hpp
   cyberverse/runtime/frame_stage.hpp
   cyberverse/runtime/frame_stats.hpp

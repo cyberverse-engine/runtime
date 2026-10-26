@@ -15,6 +15,7 @@
 #include "cyberverse/runtime/frame_budget.hpp"
 #include "cyberverse/runtime/frame_clock.hpp"
 #include "cyberverse/runtime/frame_pipeline.hpp"
+#include "cyberverse/runtime/frame_prelude.hpp"
 #include "cyberverse/runtime/frame_schedule.hpp"
 #include "cyberverse/runtime/frame_stage.hpp"
 #include "cyberverse/runtime/frame_stats.hpp"

@@ -24,12 +24,15 @@ The library currently provides:
   the per-stage `fixed_step_scheduler` factory with optional pinned overrides.
 - `frame_stage.hpp` / `.cpp` — fixed-step or variable-step update/render stage interface and frame
   lifecycle hooks.
-- `frame_pipeline.hpp` / `.cpp` — clock-tree update, stage ids/options/groups, dispatch, per-stage
-  snapshots, poll/present, quit handling, statistics, and pacing.
-- `frame_stats.hpp` / `.cpp` — aggregate frame and per-stage statistics, rolling window,
+- `frame_pipeline.hpp` / `.cpp` — clock-tree update, frame preludes, stage ids/options/groups,
+  dispatch, per-prelude/per-stage snapshots, poll/present, quit handling, statistics, and pacing.
+- `frame_prelude.hpp` — budgeted, ordered frame-start service interface for resource/GPU work that
+  is independent of stage update/render.
+- `frame_stats.hpp` / `.cpp` — aggregate frame, prelude, and per-stage statistics, rolling window,
   min/max/percentiles, EMA, FPS/utilization, jitter and over-budget flags.
 - `frame_budget.hpp` / `.cpp` — `frame_clock`-bound remaining-time budget with unlimited mode,
-  deadlines, remaining-time sub-budgets, and frame-aligned shares.
+  deadlines, remaining-time sub-budgets, and frame-aligned shares. Stage `on_update`/`on_render`
+  receive the current frame's budget; lifecycle hooks do not.
 - `task_queue.hpp` — render-thread lane without a mutex, a mutex-protected any-thread lane, and an
   RAII `pop_locker` for draining that lane.
 - `this_thread.hpp` / `.cpp` — thread-local render-thread role queried by
@@ -75,9 +78,11 @@ The runtime is layered so each piece can be tested without a window or renderer:
 4. `frame_stage` owns one update/render model and one clock. It knows nothing about the pipeline,
    other stages, or the clock tree traversal.
 5. `frame_pipeline` is the only component that calls `tick_clock()` and owns the clock tree, pacing
-   clock, schedule, stats collector, stage list/options/ids, and per-stage snapshots.
+   clock, schedule, stats collector, prelude list, stage list/options/ids, and per-prelude/per-stage
+   snapshots.
 6. `task_queue` depends only on `this_thread`; `frame_budget` requires a `frame_clock` and has no
-   wall-clock fallback. Both are leaf utilities for the future task framework.
+   wall-clock fallback. `frame_prelude` is a leaf interface consumed by `frame_pipeline` and depends
+   only on `frame_budget`. All three are reusable foundations for the future task framework.
 
 Keep the dependency direction one-way: `frame_pipeline` → `frame_schedule` / `clock_tree` /
 `frame_clock` / `frame_stage` / `frame_stats`; `this_thread` is a leaf utility used by
@@ -85,10 +90,12 @@ Keep the dependency direction one-way: `frame_pipeline` → `frame_schedule` / `
 pipeline, the platform layer, GLM, the renderer, or any engine scene type.
 
 `step_frame(dt)` is the deterministic frame primitive. It executes exactly one frame and never
-sleeps. Before any frame callback it marks the calling thread with
-`set_this_as_render_thread()`. `run()` is the convenience loop that calls `tick_clock()`, advances an
-absolute deadline on the injected `frame_clock`, calls `on_throttle_wait`, and delegates to
-`step_frame`. Do not move pacing or sleeping into `step_frame`.
+sleeps, and uses `frame_budget::unlimited()`. `step_frame(dt, budget)` accepts a caller-supplied
+budget and forwards it to stage `on_update`/`on_render`. Before any frame callback it marks the
+calling thread with `set_this_as_render_thread()`. `run()` is the convenience loop that calls
+`tick_clock()`, advances an absolute deadline on the injected `frame_clock`, calls
+`on_throttle_wait`, creates a finite frame budget, and delegates to `step_frame`. Do not move pacing
+or sleeping into `step_frame`.
 
 Each stage must own its scheduler. A `fixed_step_scheduler` stores an accumulator and either a live
 schedule reference or a standalone configuration; sharing one scheduler between stages would mix
@@ -141,9 +148,20 @@ them.
   pinned while the rest keep following the schedule. A scheduler constructed from a `schedule_config`
   is standalone and never follows a schedule. The owning schedule must outlive an inherited
   scheduler; a null owner uses the default configuration.
-- Fixed-step stages receive zero or more `on_update(logic_step, stage_tick)` calls and exactly one
-  `on_render(alpha, clock_delta)` call per frame. Variable-step stages receive exactly one
-  `on_update(clock_delta, stage_tick)` and one `on_render(1.0, clock_delta)` call per frame.
+- Fixed-step stages receive zero or more `on_update(logic_step, stage_tick, budget)` calls and
+  exactly one `on_render(clock_delta, alpha, budget)` call per frame. Variable-step stages receive
+  exactly one `on_update(clock_delta, stage_tick, budget)` and one
+  `on_render(clock_delta, 1.0, budget)` call per frame. Only these two callbacks receive the frame
+  budget; lifecycle hooks, `on_poll`, and `on_present` do not. The budget is advisory and never
+  causes the pipeline to skip a fixed step or present.
+- `frame_prelude` services run once per frame after poll/clock update and before pipeline/stage
+  `on_frame_begin`; they receive `(frame_delta, const frame_budget&)` and are independent of stage
+  update/render. Register with `add_prelude(name, unique_ptr, order)`; lower orders run first, ties
+  keep registration order. Prelude add/erase during a frame returns `operation_in_progress`;
+  `clear_preludes` is a no-op. A prelude that requests quit stops the rest of the frame. Exceptions
+  propagate out of `step_frame` and no statistics are recorded for that frame. `prelude_stats()`
+  reports each prelude's name, order, and latest execution time in registration order; registration
+  changes invalidate the view and reset the recorded times.
 - `frame_stage_options` is stored per stage. Update order uses ascending `update_order`; render order
   uses ascending `render_order`; equal values keep registration order. `enabled == false` skips all
   callbacks; `group` supports bulk enable/disable; `target_logic_hz`, `max_frame_time`, and
@@ -156,22 +174,25 @@ them.
 - Stage ids are monotonically assigned and never reused. `stage_stats()` is a zero-allocation view in
   registration order; name views are invalidated by add/erase/clear. Stage mutations during a frame
   return `std::errc::operation_in_progress`; `clear_stages` is a no-op during a frame.
-- Frame order is poll → clock-tree update → pipeline `on_frame_begin` → stage `on_frame_begin`
-  (update order) → stage updates (update order) → pipeline `on_render_frame_begin` → stage
-  `on_render_frame_begin` (render order) → stage renders (render order) → stage
-  `on_render_frame_end` (render order) → pipeline `on_render_frame_end` → present → statistics.
+- Frame order is poll → clock-tree update → frame preludes (order) → pipeline `on_frame_begin` →
+  stage `on_frame_begin` (update order) → stage updates (update order) → pipeline
+  `on_render_frame_begin` → stage `on_render_frame_begin` (render order) → stage renders (render
+  order) → stage `on_render_frame_end` (render order) → pipeline `on_render_frame_end` → present →
+  statistics.
   Stage ticks are stage-local; `frame_pipeline::tick_count()` counts update calls that actually ran.
-- `frame_stats` initializes all EMAs from the first sample and skips jitter/over-budget evaluation
-  for that sample. Later samples use `alpha * sample + (1 - alpha) * previous`. `alpha` must be in
-  `(0, 1]`; invalid values fall back to 0.1. Budget invalid values fall back to 1/60 s. The rolling
-  window is fixed at construction (clamped to `[1, max_window_size]`); `min_frame_time`,
-  `max_frame_time`, `percentile`, and `budget_margin` query it without heap allocation.
+- `frame_stats` initializes all four EMAs (frame, prelude, logic, render) from the first sample and
+  skips jitter/over-budget evaluation for that sample. Later samples use
+  `alpha * sample + (1 - alpha) * previous`. `alpha` must be in `(0, 1]`; invalid values fall back
+  to 0.1. Budget invalid values fall back to 1/60 s. The rolling window is fixed at construction
+  (clamped to `[1, max_window_size]`); `min_frame_time`, `max_frame_time`, `percentile`, and
+  `budget_margin` query it without heap allocation. `smoothed_prelude_time()` and
+  `prelude_utilization()` expose the prelude phase.
 - A frame is over budget when `frame_time > budget * 1.1` for 3 consecutive frames. A frame is jitter
   when `abs(frame_time - previous_smoothed_frame_time) > 0.2 * previous_smoothed_frame_time` for 4
   consecutive frames. `set_budget` resets the over-budget streak but keeps the EMAs.
 - `frame_pipeline::step_frame` marks the calling thread via `set_this_as_render_thread()` before
-  `on_poll`, then polls, updates the clock tree, runs frame/render lifecycle hooks, updates and
-  renders stages in their order lists, presents, records aggregate statistics, and refreshes the
+  `on_poll`, then polls, updates the clock tree, runs frame preludes, runs frame/render lifecycle hooks,
+  updates and renders stages in their order lists, presents, records aggregate statistics, and refreshes the
   statistics budget. The flag is thread-local, starts false, is not tied to one pipeline instance,
   and remains true for the thread's lifetime; `is_this_render_thread()` only observes the calling
   thread. There is no unset operation. A quit from `on_poll` skips the clock update, lifecycle hooks,
@@ -181,7 +202,11 @@ them.
   observed after presentation.
 - `tick_clock()` returns real seconds since its previous call; `run()` calls it once per iteration
   and uses the injected `frame_clock` only for deadlines. The first call may return zero.
-  `step_frame(dt)` never calls it.
+  `step_frame(dt)` never calls it and uses `frame_budget::unlimited()`; `step_frame(dt, budget)`
+  forwards the caller's budget to preludes and `on_update`/`on_render`. `run()` creates a finite
+  budget from the current target frame time and pacing clock after the throttle wait, using
+  `next_deadline + target - now` clamped to `[0, target]`; an unlimited schedule uses
+  `frame_budget::unlimited()`.
 - `on_throttle_wait(seconds)` defaults to a sleep-until wait on `pacing_clock()`. Override it for
   synthetic waits; tests should advance a manual `frame_clock` instead of sleeping. `run()` keeps an
   absolute deadline, lets small oversleeps shorten the next wait, and resynchronizes after a stall
@@ -213,11 +238,11 @@ and stage callbacks run on that thread. `request_quit()` and `should_quit()` are
 
 `task_queue` is the explicit exception for cross-thread work submission: its any-thread lane is
 mutex-protected, its render lane must be touched only by the single render thread, and the locker
-returned by `pop_locker()` must be drained by the thread that owns it. `frame_budget` is a value
-object and is not synchronized; all copies and sub-budgets share the caller-provided
-`frame_clock`. Do not add hidden background threads, global thread pools, or blocking synchronization
-to the frame path. The future job system must be introduced behind an explicit API and a roadmap
-milestone, with deterministic ordering tests.
+returned by `pop_locker()` must be drained by the thread that owns it. Frame preludes run on the loop
+thread. `frame_budget` is a value object and is not synchronized; all copies and sub-budgets share
+the caller-provided `frame_clock`. Do not add hidden background threads, global thread pools, or
+blocking synchronization to the frame path. The future job system must be introduced behind an
+explicit API and a roadmap milestone, with deterministic ordering tests.
 
 ## Style
 
